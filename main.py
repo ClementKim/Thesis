@@ -16,6 +16,8 @@ from model.experts import SelfExpert, CrossExpert, HybridExpert
 from model.router import Router
 from model.llm import LlamaLLM, Qwen25VLLLM
 
+from model.ipmoe import IPMoE
+
 def reproduce(seed):
     try:
         os.environ["PYTHONHASHSEED"] = str(seed)
@@ -63,6 +65,21 @@ def build_model(device, args):
 
     return processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm
 
+def train(model, batch):
+    model.train()
+
+    dataset_name, question, image, answer = batch
+
+    output = model(question, image)
+
+def val(model, batch):
+    model.eval()
+
+    dataset_name, question, image, answer = batch
+
+    with torch.no_grad():
+        output = model(question, image)
+
 def main(args):
     ## Random Seed
     seed = args.seed
@@ -74,6 +91,10 @@ def main(args):
 
     ## Dataset and Dataloader
     train, val = train_dataset(0.01, seed)
+
+    ## Model Building
+    processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm = build_model(device, args)
+    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm, args.embed_dim).to(device)
 
 if __name__ == "__main__":
     main()
