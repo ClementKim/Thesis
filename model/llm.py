@@ -61,23 +61,26 @@ def _format_question(question, enforce_mcq_format):
 
     return f'{question}\n\n{instruction}'
 
+class NoValidTargetsError(ValueError):
+    pass
+
 class _ImagePrefixLLM(nn.Module):
     """Shared prompt preparation and LoRA training for both language models."""
 
-    def __init__(self, model_name, model_class, lora_rank, attn_implementation, gradient_checkpointing, target_modules):
+    def __init__(self, model_name, model_class, lora_rank, attn_implementation, gradient_checkpointing, target_modules, torch_dtype = torch.float32, revision = None):
         super().__init__()
 
         if lora_rank < 1:
             raise ValueError(f'lora_rank must be positive, got {lora_rank}')
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision = revision)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.tokenizer.padding_side = 'left'
         self.marker_id = self._add_marker()
 
-        model = model_class.from_pretrained(model_name, dtype = torch.bfloat16, low_cpu_mem_usage = True,
+        model = model_class.from_pretrained(model_name, dtype = torch_dtype, revision = revision, low_cpu_mem_usage = True,
                                             attn_implementation = attn_implementation)
 
         # Cache off for training. generate() turns it back on.
@@ -154,6 +157,7 @@ class _ImagePrefixLLM(nn.Module):
         insert_positions = []
 
         for row_index, (question, answer) in enumerate(zip(questions, answers)):
+            text_budget = max_total_tokens if isinstance(max_total_tokens, int) else max_total_tokens[row_index]
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
             assistant_message = {'role': 'assistant', 'content': str(answer)}
 
@@ -167,14 +171,9 @@ class _ImagePrefixLLM(nn.Module):
             prompt_length = len(prompt_ids)
             if full_ids[:prompt_length] != prompt_ids:
                 raise RuntimeError('Assistant target sequence is not prefix-aligned with the prompt')
-            if prompt_length >= max_total_tokens:
+            # Keep the complete answer and its model-specific termination suffix.
+            if len(full_ids) > text_budget:
                 continue
-
-            # Cut the answer if too long, but keep the last token.
-            if len(full_ids) > max_total_tokens:
-                final_token_id = full_ids[-1]
-                full_ids = full_ids[:max_total_tokens]
-                full_ids[-1] = final_token_id
 
             # Ignore prompt tokens when computing the loss.
             labels = [-100] * prompt_length + full_ids[prompt_length:]
@@ -187,7 +186,7 @@ class _ImagePrefixLLM(nn.Module):
             insert_positions.append(prompt_insert_position)
 
         if not token_rows:
-            raise ValueError(f'Every prompt exceeded {max_total_tokens} tokens')
+            raise NoValidTargetsError('No complete training answers fit the text budget')
 
         return token_rows, label_rows, kept_rows, insert_positions
 
@@ -197,12 +196,13 @@ class _ImagePrefixLLM(nn.Module):
         insert_positions = []
 
         for row_index, question in enumerate(questions):
+            text_budget = max_prompt_tokens if isinstance(max_prompt_tokens, int) else max_prompt_tokens[row_index]
             question = _format_question(question, enforce_mcq_format)
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
             prompt_ids, insert_position = self._tokenize_chat([user_message], add_generation_prompt = True)
 
-            if len(prompt_ids) > max_prompt_tokens:
-                raise ValueError(f'Generation prompt too long: sample={row_index}, tokens={len(prompt_ids)}, limit={max_prompt_tokens}')
+            if len(prompt_ids) > text_budget:
+                raise ValueError(f'Generation prompt too long: sample={row_index}, tokens={len(prompt_ids)}, limit={text_budget}')
 
             token_row = torch.tensor(prompt_ids, dtype = torch.long, device = self.device)
             token_rows.append(token_row)
@@ -210,7 +210,7 @@ class _ImagePrefixLLM(nn.Module):
 
         return token_rows, insert_positions
 
-    def _insert_prefix(self, token_rows, insert_positions, prefix, label_rows):
+    def _insert_prefix(self, token_rows, insert_positions, prefix, label_rows, prefix_mask = None):
         """Insert each image's features into its text embeddings and label sequence."""
         B, P, H = prefix.shape
         embed = self.model.get_input_embeddings()
@@ -225,7 +225,10 @@ class _ImagePrefixLLM(nn.Module):
 
             token_embeddings = embed(token_row)
             text_before = token_embeddings[:insert_position]
-            image_features = prefix[row_index].to(token_embeddings.dtype)
+            image_features = prefix[row_index]
+            if prefix_mask is not None:
+                image_features = image_features[prefix_mask[row_index].bool()]
+            image_features = image_features.to(token_embeddings.dtype)
             text_after = token_embeddings[insert_position:]
 
             input_row = torch.cat([text_before, image_features, text_after], dim = 0)
@@ -237,7 +240,7 @@ class _ImagePrefixLLM(nn.Module):
                 labels_after = text_labels[insert_position:]
 
                 # Image features are inputs, so they have no target token labels.
-                image_labels = torch.full((P,), -100, dtype = text_labels.dtype, device = text_labels.device)
+                image_labels = torch.full((image_features.size(0),), -100, dtype = text_labels.dtype, device = text_labels.device)
                 label_row = torch.cat([labels_before, image_labels, labels_after], dim = 0)
                 merged_label_rows.append(label_row)
 
@@ -279,7 +282,7 @@ class _ImagePrefixLLM(nn.Module):
 
         return input_embeds, attention_mask, position_ids, labels
 
-    def build_inputs(self, token_rows, insert_positions, prefix, label_rows = None):
+    def build_inputs(self, token_rows, insert_positions, prefix, label_rows = None, prefix_mask = None):
         """Insert image features (B, P, H), then return padded embeddings, masks, positions, and labels."""
         if prefix.ndim != 3:
             raise ValueError(f'prefix must have shape (B, P, H), got {tuple(prefix.shape)}')
@@ -292,7 +295,7 @@ class _ImagePrefixLLM(nn.Module):
         if label_rows is not None and len(label_rows) != B:
             raise ValueError('label_rows batch does not match prefix batch')
 
-        input_rows, merged_label_rows = self._insert_prefix(token_rows, insert_positions, prefix, label_rows)
+        input_rows, merged_label_rows = self._insert_prefix(token_rows, insert_positions, prefix, label_rows, prefix_mask)
 
         return self._pad_inputs(input_rows, merged_label_rows)
 
@@ -337,10 +340,10 @@ class _ImagePrefixLLM(nn.Module):
         if max_new_tokens < 1:
             raise ValueError('max_new_tokens must be positive')
 
+        # Keep all EOS IDs from the checkpoint's generation configuration.
         # generate() updates positions from the mask as it adds tokens.
         generated_ids = self.model.generate(inputs_embeds = input_embeds, attention_mask = attention_mask, max_new_tokens = max_new_tokens,
-                                            do_sample = False, use_cache = True, pad_token_id = self.tokenizer.pad_token_id,
-                                            eos_token_id = self.tokenizer.eos_token_id)
+                                            do_sample = False, use_cache = True, pad_token_id = self.tokenizer.pad_token_id)
         decoded = self.tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
 
         return [prediction.strip() for prediction in decoded]
@@ -348,7 +351,7 @@ class _ImagePrefixLLM(nn.Module):
 class LlamaLLM(_ImagePrefixLLM):
     """Frozen Llama with trainable LoRA adapters and its tokenizer."""
 
-    def __init__(self, llm_size = 1, lora_rank = 64, attn_implementation = 'flash_attention_2', gradient_checkpointing = True):
+    def __init__(self, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
         if llm_size not in MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(MODEL_NAMES)}')
 
@@ -356,12 +359,12 @@ class LlamaLLM(_ImagePrefixLLM):
         target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
 
         super().__init__(model_name, AutoModelForCausalLM, lora_rank, attn_implementation,
-                         gradient_checkpointing, target_modules)
+                         gradient_checkpointing, target_modules, torch_dtype, revision)
 
 class Qwen25VLLLM(_ImagePrefixLLM):
     """Qwen2.5-VL with decoder LoRA. Image features must already match its embedding width."""
 
-    def __init__(self, llm_size = 3, lora_rank = 64, attn_implementation = 'flash_attention_2', gradient_checkpointing = True):
+    def __init__(self, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
         if llm_size not in QWEN_MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(QWEN_MODEL_NAMES)}')
 
@@ -375,12 +378,12 @@ class Qwen25VLLLM(_ImagePrefixLLM):
 
         # Our image features use sequence positions on all three Qwen MRoPE axes.
         super().__init__(model_name, Qwen2_5_VLForConditionalGeneration, lora_rank, attn_implementation,
-                         gradient_checkpointing, target_modules)
+                         gradient_checkpointing, target_modules, torch_dtype, revision)
 
-def llamaAPI(device, llm_size = 1, lora_rank = 64, attn_implementation = 'flash_attention_2', gradient_checkpointing = True):
+def llamaAPI(device, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
     """Build the Llama model with LoRA adapters on the given device."""
-    return LlamaLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing).to(device)
+    return LlamaLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype, revision).to(device)
 
-def qwenAPI(device, llm_size = 3, lora_rank = 64, attn_implementation = 'flash_attention_2', gradient_checkpointing = True):
+def qwenAPI(device, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
     """Build Qwen2.5-VL with LoRA adapters for the same image-prefix interface as Llama."""
-    return Qwen25VLLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing).to(device)
+    return Qwen25VLLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype, revision).to(device)

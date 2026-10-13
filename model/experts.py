@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 
 if __package__:
@@ -26,10 +25,11 @@ class SelfExpert(nn.Module):
         norm_layer = nn.LayerNorm
         self.norm = norm_layer(embed_dim)
 
-    def forward(self, x):
-        x = self.patch_embed(x)
-        x = self.blocks(x)
-        x = self.norm(x)
+    def forward(self, x, mask = None):
+        x, mask = self.patch_embed(x, mask)
+        for block in self.blocks:
+            x = block(x, mask)
+        x = self.norm(x[:, :1])
 
         return x
 
@@ -51,13 +51,14 @@ class CrossExpert(nn.Module):
         norm_layer = nn.LayerNorm
         self.norm = norm_layer(embed_dim)
 
-    def forward(self, x, auxiliary):
-        x = self.patch_embed(x)
+    def forward(self, x, auxiliary, mask = None):
+        x, mask = self.patch_embed(x, mask)
+        auxiliary = auxiliary.expand(x.size(0), -1, -1)
         for block in self.blocks:
-            x = block(x, auxiliary)
-        x = self.norm(x)
+            auxiliary = block(auxiliary, x, mask)
+        auxiliary = self.norm(auxiliary)
 
-        return x
+        return auxiliary
 
 class HybridExpert(nn.Module):
     def __init__(self, interaction_size, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
@@ -78,13 +79,14 @@ class HybridExpert(nn.Module):
         norm_layer = nn.LayerNorm
         self.norm = norm_layer(embed_dim)
 
-    def forward(self, x, auxiliary):
-        x = self.patch_embed(x)
+    def forward(self, x, auxiliary, mask = None):
+        x, mask = self.patch_embed(x, mask)
+        auxiliary = auxiliary.expand(x.size(0), -1, -1)
         for i in range(self.depth):
             if i % 2 == 0:
-                x = self.blocks[i](x)
+                x = self.blocks[i](x, mask)
             else:
-                x = self.blocks[i](x, auxiliary)
-        x = self.norm(x)
+                auxiliary = self.blocks[i](auxiliary, x, mask)
+        auxiliary = self.norm(auxiliary)
 
-        return x
+        return auxiliary

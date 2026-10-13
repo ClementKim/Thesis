@@ -1,20 +1,20 @@
+import os
+import argparse
 import torch
 import random
 
 import numpy as np
-import torch.nn as nn
-
-from sys import os
+from torch.utils.data import DataLoader
 
 # Dataset
-from preprocessing import train_dataset
+from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL, SOURCES
 
 # Proposed Method
 from model.encoder import encoding
 from model.interaction import Interaction
 from model.experts import SelfExpert, CrossExpert, HybridExpert
-from model.router import Router
-from model.llm import LlamaLLM, Qwen25VLLLM
+from model.router import DenseMoE
+from model.llm import LlamaLLM, Qwen25VLLLM, NoValidTargetsError
 
 from model.ipmoe import IPMoE
 
@@ -43,42 +43,50 @@ def reproduce(seed):
 
 def build_model(device, args):
     ## CLIP
-    processor, text_encoder, vision_encoder = encoding(args.drop, device, args.embed_dim)
+    processor, text_encoder, vision_encoder = encoding(args.drop, device, args.embed_dim, revision = args.clip_revision)
 
     ## Interaction Matrix Constructor
     interaction = Interaction(args.interaction_type)
 
     ## Experts
-    self_experts   = nn.ModuleList([SelfExpert(args.interaction_size, args.patch_size, args.in_c, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, args.is_cls_token) for _ in range(args.num_experts)])
-    cross_experts  = nn.ModuleList([CrossExpert(args.interaction_size, args.patch_size, args.in_c, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, args.is_cls_token) for _ in range(args.num_experts)])
-    hybrid_experts = nn.ModuleList([HybridExpert(args.interaction_size, args.patch_size, args.in_c, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, args.is_cls_token) for _ in range(args.num_experts)])
+    self_expert = SelfExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, True)
+    cross_expert = CrossExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
+    hybrid_expert = HybridExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
 
     ## Router
-    router = Router(args.embed_dim, args.num_experts)
+    moe = DenseMoE(1, self_expert, cross_expert, hybrid_expert)
 
     ## LLM
+    dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+
     if args.llm_type == "llama":
-        llm = LlamaLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing)
+        llm = LlamaLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype, args.llm_revision)
 
     elif args.llm_type == "qwen":
-        llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing)
+        llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype, args.llm_revision)
 
-    return processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm
+    args.clip_revision = getattr(text_encoder.clip.config, '_commit_hash', None) or args.clip_revision
+    args.llm_revision = getattr(llm.model.config, '_commit_hash', None) or args.llm_revision
 
-def train(model, batch):
+    return processor, text_encoder, vision_encoder, interaction, moe, llm
+
+def batch_loss(model, batch, device, context_limit):
+    _, question, text_inputs, image_inputs, answer = batch
+    text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
+    image_inputs = {key: value.to(device) for key, value in image_inputs.items()}
+
+    return model(question, text_inputs, image_inputs, answer, context_limit)
+
+def train(model, batch, device, context_limit):
     model.train()
 
-    dataset_name, question, image, answer = batch
+    return batch_loss(model, batch, device, context_limit)
 
-    output = model(question, image)
-
-def val(model, batch):
+def val(model, batch, device, context_limit):
     model.eval()
 
-    dataset_name, question, image, answer = batch
-
     with torch.no_grad():
-        output = model(question, image)
+        return batch_loss(model, batch, device, context_limit)
 
 def main(args):
     ## Random Seed
@@ -89,12 +97,119 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    ## Checkpoint
+    checkpoint = None
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location = 'cpu', weights_only = False)
+        saved_args = checkpoint['args']
+        args.clip_revision = saved_args['clip_revision']
+        args.llm_revision = saved_args['llm_revision']
+
     ## Dataset and Dataloader
-    train, val = train_dataset(0.01, seed)
+    train_set, val_set = train_dataset(args.val_fraction, args.seed, max_train_samples = args.max_train_samples)
 
     ## Model Building
-    processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm = build_model(device, args)
-    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm, args.embed_dim).to(device)
+    processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
+    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm, args.embed_dim, args.patch_size).to(device)
+
+    generator = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = True,
+                              collate_fn = make_collate_fn(processor), generator = generator)
+    val_loader = DataLoader(val_set, batch_size = args.batch_size, shuffle = False,
+                            collate_fn = make_collate_fn(processor), generator = torch.Generator().manual_seed(seed))
+
+    ## Optimizer
+    optimizer = torch.optim.AdamW((parameter for parameter in ipmoe.parameters() if parameter.requires_grad), lr = args.learning_rate)
+    start_epoch = 0
+    step = 0
+    if checkpoint is not None:
+        ipmoe.load_state_dict(checkpoint['model'], strict = False)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch']
+        step = checkpoint['step']
+        random.setstate(checkpoint['random_state'])
+        np.random.set_state(checkpoint['numpy_state'])
+        torch.set_rng_state(checkpoint['torch_state'])
+        generator.set_state(checkpoint['loader_state'])
+        if device == 'cuda' and checkpoint['cuda_state'] is not None:
+            torch.cuda.set_rng_state_all(checkpoint['cuda_state'])
+        elif device == 'mps' and checkpoint['mps_state'] is not None:
+            torch.mps.set_rng_state(checkpoint['mps_state'])
+
+    ## Training and Validation
+    os.makedirs(args.output_dir, exist_ok = True)
+    for epoch in range(start_epoch, args.epochs):
+        skipped = 0
+        for batch in train_loader:
+            optimizer.zero_grad(set_to_none = True)
+            try:
+                loss, weights = train(ipmoe, batch, device, args.context_limit)
+            except NoValidTargetsError:
+                skipped += len(batch[1])
+                continue
+
+            loss.backward()
+            optimizer.step()
+            step += 1
+            skipped += len(batch[1]) - weights.size(0)
+            print(f'Epoch {epoch + 1}, step {step}, loss {loss.item():.4f}')
+
+        val_loss = 0.0
+        val_batches = 0
+        for batch in val_loader:
+            try:
+                loss, _ = val(ipmoe, batch, device, args.context_limit)
+            except NoValidTargetsError:
+                continue
+            val_loss += loss.item()
+            val_batches += 1
+
+        mean_loss = val_loss / val_batches if val_batches else None
+        print(f'Validation batch-mean loss: {mean_loss}, skipped training examples: {skipped}')
+
+        ## Save at the End of Each Epoch
+        torch.save({
+            'model': {name: parameter.detach().cpu() for name, parameter in ipmoe.named_parameters() if parameter.requires_grad},
+            'optimizer': optimizer.state_dict(), 'args': vars(args), 'epoch': epoch + 1, 'step': step,
+            'protocol': PREPROCESSING_PROTOCOL, 'source': SOURCES,
+            'random_state': random.getstate(), 'numpy_state': np.random.get_state(),
+            'torch_state': torch.get_rng_state(), 'loader_state': generator.get_state(),
+            'cuda_state': torch.cuda.get_rng_state_all() if device == 'cuda' else None,
+            'mps_state': torch.mps.get_rng_state() if device == 'mps' else None,
+        }, os.path.join(args.output_dir, 'checkpoint.pt.tmp'))
+        os.replace(os.path.join(args.output_dir, 'checkpoint.pt.tmp'), os.path.join(args.output_dir, 'checkpoint.pt'))
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type = int, default = 42)
+
+    parser.add_argument('--interaction-type', default = 'bilinear')
+
+    parser.add_argument('--patch-size', type = int, default = 16)
+    parser.add_argument('--embed-dim', type = int, default = 1024)
+    parser.add_argument('--num-heads', type = int, default = 16)
+    parser.add_argument('--mlp-ratio', type = float, default = 2.0)
+    parser.add_argument('--drop', type = float, default = 0.0)
+    parser.add_argument('--attn-drop', type = float, default = 0.0)
+    parser.add_argument('--llm-type', default = 'llama')
+    parser.add_argument('--llm-size', type = int, default = 3)
+    parser.add_argument('--lora-rank', type = int, default = 64)
+    parser.add_argument('--clip-revision', default = None)
+    parser.add_argument('--llm-revision', default = None)
+    parser.add_argument('--attn-implementation', default = 'flash_attention_2')
+
+    parser.add_argument('--gradient-checkpointing', action = argparse.BooleanOptionalAction, default = True)
+    parser.add_argument('--context-limit', type = int, default = 4096)
+    parser.add_argument('--batch-size', type = int, default = 1)
+    parser.add_argument('--epochs', type = int, default = 1)
+    parser.add_argument('--learning-rate', type = float, default = 1e-4)
+    parser.add_argument('--val-fraction', type = float, default = 0.01)
+    parser.add_argument('--max-train-samples', type = int, default = None)
+    parser.add_argument('--output-dir', default = 'checkpoint')
+    parser.add_argument('--resume', default = None)
+    args = parser.parse_args()
+
+    return args
 
 if __name__ == "__main__":
-    main()
+    main(parse_args())

@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import tempfile
 from collections import defaultdict
 from collections.abc import Mapping
 
@@ -15,7 +16,7 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'simoe-llava-next-singleturn-v1'
+PREPROCESSING_PROTOCOL = 'simoe-llava-next-singleturn-v2'
 CACHE_DIRECTORY = 'dataset/cache'
 
 # Pin the dataset version so repeated builds use the same source data.
@@ -43,11 +44,15 @@ def save_as_json(value, path):
     if directory:
         os.makedirs(directory, exist_ok = True)
 
-    temporary = f'{path}.tmp.{os.getpid()}'
-    with open(temporary, 'w', encoding = 'utf-8', buffering = 8 * 1024 * 1024) as handle:
-        json.dump(value, handle, ensure_ascii = False, separators = (',', ':'))
+    descriptor, temporary = tempfile.mkstemp(prefix = '.json-', suffix = '.tmp', dir = directory or '.')
+    try:
+        with os.fdopen(descriptor, 'w', encoding = 'utf-8', buffering = 8 * 1024 * 1024) as handle:
+            json.dump(value, handle, ensure_ascii = False, separators = (',', ':'))
 
-    os.replace(temporary, path)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 def load_json(path):
     with open(path, encoding = 'utf-8') as handle:
@@ -185,7 +190,9 @@ def _first_user_assistant_pair(conversations):
         if not value:
             continue
 
-        if question is None and role in {'human', 'user'}:
+        if role in {'human', 'user'}:
+            if question is not None:
+                return '', ''
             question = value
 
         elif question is not None and role in {'gpt', 'assistant'}:
@@ -215,7 +222,8 @@ def llava_next_instruct(*, max_samples = None):
 
         # The model inserts image features itself, so remove the old marker.
         question = re.sub(r'<\s*image\s*>', ' ', question, flags = re.IGNORECASE)
-        question = re.sub(r'\s+', ' ', question).strip()
+        question = question.replace('\r\n', '\n').replace('\r', '\n')
+        question = re.sub(r'[^\S\n]+', ' ', question).strip()
 
         if not question or not answer:
             counters['malformed'] += 1
@@ -354,44 +362,55 @@ def make_collate_fn(processor):
     """Attach the processor while keeping the function picklable for DataLoader workers."""
     return functools.partial(collate_fn, processor = processor)
 
-def _cache_is_current(manifest_path, config, paths):
-    """Check that both caches exist and their saved settings match this build."""
-    if not os.path.exists(manifest_path):
+def _cache_is_current(manifest, config):
+    """Check one loaded manifest and its immutable partition files."""
+    if not isinstance(manifest, Mapping) or manifest.get('config') != config:
         return False
 
-    for path in paths:
-        if not os.path.exists(path):
+    for name in ('train', 'validation'):
+        path = manifest.get(f'{name}_path')
+        if not path:
+            return False
+        try:
+            digest = hashlib.sha256()
+            with open(path, 'rb') as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(block)
+        except OSError:
+            return False
+        if digest.hexdigest() != manifest.get(f'{name}_sha256'):
             return False
 
-    try:
-        manifest = load_json(manifest_path)
-    except (ValueError, OSError):
-        return False
-
-    return manifest.get('config') == config
+    return True
 
 def train_dataset(val_fraction = 0.01, seed = 42, *, max_train_samples = None):
     """Load cached train/validation datasets, or build and save a new split."""
     if not 0.0 < val_fraction < 1.0:
         raise ValueError('val_fraction must be between 0 and 1')
 
-    train_path = os.path.join(CACHE_DIRECTORY, f'train_{PREPROCESSING_PROTOCOL}.json')
-    validation_path = os.path.join(CACHE_DIRECTORY, f'val_{PREPROCESSING_PROTOCOL}.json')
-    manifest_path = os.path.join(CACHE_DIRECTORY, f'train_manifest_{PREPROCESSING_PROTOCOL}.json')
-
     # Changing any of these settings requires a new split.
     source = SOURCES['llava_next']
     train_config = {
+        'protocol': PREPROCESSING_PROTOCOL,
         'source': source['repo'],
         'revision': source['revision'],
+        'patterns': list(source['patterns']),
         'max_train_samples': max_train_samples,
         'val_fraction': val_fraction,
         'seed': seed,
     }
 
-    if _cache_is_current(manifest_path, train_config, (train_path, validation_path)):
-        train = load_json(train_path)
-        validation = load_json(validation_path)
+    cache_key = hashlib.sha256(json.dumps(train_config, sort_keys = True).encode('utf-8')).hexdigest()
+    configuration_directory = os.path.abspath(os.path.join(CACHE_DIRECTORY, cache_key))
+    manifest_path = os.path.join(configuration_directory, 'manifest.json')
+    try:
+        manifest = load_json(manifest_path)
+    except (ValueError, OSError):
+        manifest = None
+
+    if _cache_is_current(manifest, train_config):
+        train = load_json(manifest['train_path'])
+        validation = load_json(manifest['validation_path'])
     else:
         complete = llava_next_instruct(max_samples = max_train_samples)
 
@@ -400,6 +419,13 @@ def train_dataset(val_fraction = 0.01, seed = 42, *, max_train_samples = None):
         train = {'llava_next': train_samples}
         validation = {'llava_next': validation_samples}
 
+        os.makedirs(configuration_directory, exist_ok = True)
+        generation_directory = tempfile.mkdtemp(prefix = 'generation-', dir = configuration_directory)
+        train_path = os.path.join(generation_directory, 'train.json')
+        validation_path = os.path.join(generation_directory, 'validation.json')
+        save_as_json(train, train_path)
+        save_as_json(validation, validation_path)
+
         manifest = {
             'protocol': PREPROCESSING_PROTOCOL,
             'config': train_config,
@@ -407,8 +433,15 @@ def train_dataset(val_fraction = 0.01, seed = 42, *, max_train_samples = None):
             'validation_samples': len(validation_samples),
         }
 
-        save_as_json(train, train_path)
-        save_as_json(validation, validation_path)
+        for name, path in (('train', train_path), ('validation', validation_path)):
+            digest = hashlib.sha256()
+            with open(path, 'rb') as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(block)
+            manifest[f'{name}_path'] = path
+            manifest[f'{name}_sha256'] = digest.hexdigest()
+
+        # Only completed generations are published; their files are never overwritten.
         save_as_json(manifest, manifest_path)
 
         print(f'Grouped LLaVA-NeXT split: train={len(train_samples):,}, val={len(validation_samples):,}')

@@ -11,13 +11,14 @@ MODEL_NAME = 'openai/clip-vit-large-patch14-336'
 class CLIPEncoder(nn.Module):
     """One frozen backbone shared by the text and image encoders."""
 
-    def __init__(self):
+    def __init__(self, revision = None):
         super().__init__()
 
-        self.model = CLIPModel.from_pretrained(MODEL_NAME)
+        self.model = CLIPModel.from_pretrained(MODEL_NAME, revision = revision)
 
         for parameter in self.model.parameters():
             parameter.requires_grad = False
+        self.model.eval()
 
     @property
     def config(self):
@@ -190,12 +191,12 @@ class VisionEncoder(nn.Module):
 
         return self.mlp(patches)
 
-def encoding(drop, device, out_dim = None):
+def encoding(drop, device, out_dim = None, revision = None):
     """Build the processor and both encoders with one shared CLIP backbone."""
-    image_size = int(CLIPConfig.from_pretrained(MODEL_NAME).vision_config.image_size)
+    image_size = int(CLIPConfig.from_pretrained(MODEL_NAME, revision = revision).vision_config.image_size)
     # Keep the whole image; center cropping could remove regions in the question.
-    processor = CLIPProcessor.from_pretrained(MODEL_NAME, use_fast = True, size = {'height': image_size, 'width': image_size}, do_center_crop = False)
-    clip = CLIPEncoder().to(device)
+    processor = CLIPProcessor.from_pretrained(MODEL_NAME, revision = revision, use_fast = True, size = {'height': image_size, 'width': image_size}, do_center_crop = False)
+    clip = CLIPEncoder(revision).to(device)
     text_encoder = TextEncoder(clip, drop, out_dim).to(device)
     vision_encoder = VisionEncoder(clip, drop, out_dim).to(device)
 

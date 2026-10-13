@@ -1,43 +1,73 @@
 import torch
 import torch.nn as nn
 
+from .interaction import InteractionAdapter
+
 class IPMoE(nn.Module):
-    def __init__(self, processor, text_encoder, vision_encoder, interaction, self_experts, cross_experts, hybrid_experts, router, llm, embed_dim):
+    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size):
         super().__init__()
 
         self.processor = processor
         self.text_encoder = text_encoder
         self.vision_encoder = vision_encoder
         self.interaction = interaction
-        self.self_experts = self_experts
-        self.cross_experts = cross_experts
-        self.hybrid_experts = hybrid_experts
-        self.router = router
+        self.moe = moe
         self.llm = llm
 
         ## Auxiliary Token
         self.aux = nn.Parameter(torch.randn(1, 1, embed_dim))
 
-    def forward(self, question, image):
-        # Process the image and question
-        image_features = self.vision_encoder(image)
-        text_features = self.text_encoder(question)
+        ## Interaction Map and LLM Projection Heads
+        self.interaction_adapter = InteractionAdapter(embed_dim, patch_size)
+        llm_width = self.llm.model.get_input_embeddings().embedding_dim
+        self.image_head = nn.Linear(embed_dim, llm_width)
+        self.interaction_head = nn.Linear(embed_dim, llm_width)
+        self.expert_head = nn.Linear(embed_dim, llm_width)
 
-        # Interaction between text and vision features
-        interaction_output = self.interaction(text_features, image_features)
+    def encode_prefix(self, text_inputs, image_inputs):
+        # Process the image and question.
+        text_features, text_mask = self.text_encoder(**text_inputs)
+        image_features = self.vision_encoder(**image_inputs)
 
-        # Routing to experts
-        expert_outputs = []
-        for i in range(len(self.self_experts)):
-            self_output = self.self_experts[i](interaction_output)
-            cross_output = self.cross_experts[i](interaction_output, self.aux)
-            hybrid_output = self.hybrid_experts[i](interaction_output, self.aux)
-            expert_outputs.append((self_output, cross_output, hybrid_output))
+        # Interaction between text and vision features.
+        similarity = self.interaction(text_features, image_features)
+        interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
 
-        # Combine expert outputs (this is a placeholder; actual combination logic may vary)
-        combined_output = torch.mean(torch.stack([torch.mean(torch.stack(outputs), dim=0) for outputs in expert_outputs]), dim=0)
+        # Route to one self, one cross, and one hybrid expert.
+        expert_outputs, weights = self.moe(interaction_map, self.aux, mask = map_mask)
 
-        # Pass through the LLM
-        llm_output = self.llm(combined_output)
+        # Pass image, interaction, and each weighted expert output to the LLM.
+        prefix = torch.cat([self.image_head(image_features), self.interaction_head(interaction_tokens),
+                            self.expert_head(expert_outputs)], dim = 1)
+        image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = prefix.device)
+        expert_mask = torch.ones(expert_outputs.shape[:2], dtype = torch.bool, device = prefix.device)
+        prefix_mask = torch.cat([image_mask, token_mask, expert_mask], dim = 1)
 
-        return llm_output
+        return prefix, prefix_mask, weights
+
+    def forward(self, questions, text_inputs, image_inputs, answers, context_limit):
+        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
+        text_budget = [context_limit - length for length in prefix_mask.sum(dim = 1).tolist()]
+
+        # The LLM receives the original question and supervises only its answer.
+        token_rows, label_rows, kept_rows, positions = self.llm.tokenize_training_chats(questions, answers, max_total_tokens = text_budget)
+        kept = torch.tensor(kept_rows, dtype = torch.long, device = prefix.device)
+        prefix = prefix.index_select(0, kept)
+        prefix_mask = prefix_mask.index_select(0, kept)
+        weights = weights.index_select(0, kept)
+
+        embeds, mask, position_ids, labels = self.llm.build_inputs(token_rows, positions, prefix, label_rows, prefix_mask = prefix_mask)
+        loss = self.llm(embeds, mask, position_ids, labels)
+
+        return loss, weights
+
+    @torch.no_grad()
+    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32):
+        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
+        text_budget = [context_limit - length - max_new_tokens for length in prefix_mask.sum(dim = 1).tolist()]
+
+        token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget)
+        embeds, mask, _, _ = self.llm.build_inputs(token_rows, positions, prefix, prefix_mask = prefix_mask)
+        answers = self.llm.generate(embeds, mask, max_new_tokens = max_new_tokens)
+
+        return answers, weights
