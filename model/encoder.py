@@ -1,5 +1,3 @@
-"""Frozen CLIP text and image token encoders with trainable projections."""
-
 import math
 
 import torch
@@ -63,7 +61,7 @@ class TextEncoder(nn.Module):
 
         encoding = torch.zeros(num_chunks, dim, device = device, dtype = torch.float32)
         encoding[:, 0::2] = torch.sin(angles)
-        
+
         # Odd widths have one fewer cosine slot.
         cosine_width = encoding[:, 1::2].shape[1]
         encoding[:, 1::2] = torch.cos(angles[:, :cosine_width])

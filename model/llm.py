@@ -1,5 +1,3 @@
-"""Llama and Qwen2.5-VL with LoRA adapters and image features inside the prompt."""
-
 import inspect
 import re
 

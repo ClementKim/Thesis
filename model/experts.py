@@ -59,7 +59,7 @@ class CrossExpert(nn.Module):
 
         return x
 
-class Hybrid(nn.Module):
+class HybridExpert(nn.Module):
     def __init__(self, interaction_size, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
         super().__init__()
 

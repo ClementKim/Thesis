@@ -1,10 +1,3 @@
-"""Prepare LLaVA-NeXT images and question/answer pairs for training.
-
-Cached sample: {'question': text, 'answer': text, 'img_path': path}
-Dataset item: (dataset_name, question, image, answer)
-Batch: (dataset_names, questions, text_inputs, image_inputs, answers)
-"""
-
 import functools
 import glob
 import hashlib
