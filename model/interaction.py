@@ -13,9 +13,6 @@ class Interaction(nn.Module):
         if self.interaction_type == "bilinear":
             return torch.bmm(text, vision.transpose(1, 2))
 
-        elif self.interaction_type == "additive":
-            return text + vision
-
 class InteractionAdapter(nn.Module):
     """Keep the rectangular token-patch plane and embed it for the LLM prefix."""
 

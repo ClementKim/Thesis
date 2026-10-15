@@ -16,7 +16,7 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'simoe-llava-next-singleturn-v2'
+PREPROCESSING_PROTOCOL = 'simoe-llava-next-singleturn-v4'
 CACHE_DIRECTORY = 'dataset/cache'
 
 # Pin the dataset version so repeated builds use the same source data.
@@ -254,44 +254,6 @@ def llava_next_instruct(*, max_samples = None):
 
     return samples
 
-def grouped_train_val_split(samples, *, val_fraction, seed):
-    """Keep all questions for each image together, targeting val_fraction of samples."""
-    if not 0.0 < val_fraction < 1.0:
-        raise ValueError('val_fraction must be between 0 and 1')
-
-    groups = defaultdict(list)
-    for sample_id, sample in samples.items():
-        image_path = str(sample['img_path'])
-        groups[image_path].append(sample_id)
-
-    if len(groups) < 2:
-        raise ValueError('At least two distinct images are required for a grouped split')
-
-    # Sort first so the same seed selects the same images regardless of input order.
-    group_ids = sorted(groups)
-    random.Random(seed).shuffle(group_ids)
-
-    target = max(1, round(len(samples) * val_fraction))
-    validation = {}
-
-    # Reserve the last image group for training. Whole groups may exceed the target.
-    for group_id in group_ids[:-1]:
-        if len(validation) >= target:
-            break
-
-        for sample_id in groups[group_id]:
-            validation[sample_id] = samples[sample_id]
-
-    train = {}
-    for sample_id, sample in samples.items():
-        if sample_id not in validation:
-            train[sample_id] = sample
-
-    if not train or not validation:
-        raise RuntimeError('Grouped split produced an empty partition')
-
-    return train, validation
-
 class CustomDataset(data.Dataset):
     """Index cached samples and load each image only when it is requested."""
 
@@ -363,32 +325,55 @@ def make_collate_fn(processor):
     return functools.partial(collate_fn, processor = processor)
 
 def _cache_is_current(manifest, config):
-    """Check one loaded manifest and its immutable partition files."""
+    """Check one loaded manifest and its cached training data."""
     if not isinstance(manifest, Mapping) or manifest.get('config') != config:
         return False
 
-    for name in ('train', 'validation'):
-        path = manifest.get(f'{name}_path')
-        if not path:
-            return False
-        try:
-            digest = hashlib.sha256()
-            with open(path, 'rb') as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b''):
-                    digest.update(block)
-        except OSError:
-            return False
-        if digest.hexdigest() != manifest.get(f'{name}_sha256'):
-            return False
+    path = manifest.get('train_path')
+    if not path:
+        return False
+    try:
+        digest = hashlib.sha256()
+        with open(path, 'rb') as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(block)
+    except OSError:
+        return False
 
-    return True
+    return digest.hexdigest() == manifest.get('train_sha256')
 
-def train_dataset(val_fraction = 0.01, seed = 42, *, max_train_samples = None):
-    """Load cached train/validation datasets, or build and save a new split."""
-    if not 0.0 < val_fraction < 1.0:
-        raise ValueError('val_fraction must be between 0 and 1')
+def grouped_train_val_split(dataset, seed = 42):
+    """Keep each image in one set, targeting 90% training and 10% validation."""
+    groups = defaultdict(list)
+    for index, image_path in enumerate(dataset.image_paths):
+        groups[image_path].append(index)
 
-    # Changing any of these settings requires a new split.
+    if len(groups) < 2:
+        raise ValueError('At least two distinct images are required for a train/validation split')
+
+    image_paths = sorted(groups)
+    random.Random(seed).shuffle(image_paths)
+    target = max(1, round(len(dataset) * 0.1))
+    val_indices = []
+
+    # Add whole image groups only when they bring validation closer to 10%.
+    for image_path in image_paths:
+        indices = groups[image_path]
+        if abs(len(val_indices) + len(indices) - target) < abs(len(val_indices) - target):
+            val_indices.extend(indices)
+
+    closest_image = min(image_paths, key = lambda path: abs(len(groups[path]) - target))
+    if not val_indices or abs(len(groups[closest_image]) - target) < abs(len(val_indices) - target):
+        val_indices = groups[closest_image]
+
+    val_indices = set(val_indices)
+    train_indices = [index for index in range(len(dataset)) if index not in val_indices]
+
+    return data.Subset(dataset, train_indices), data.Subset(dataset, sorted(val_indices))
+
+def train_dataset(seed = 42, *, max_train_samples = None):
+    """Load the cached source samples, then split them by image into train and validation."""
+    # Changing any of these settings requires a new cache.
     source = SOURCES['llava_next']
     train_config = {
         'protocol': PREPROCESSING_PROTOCOL,
@@ -396,7 +381,6 @@ def train_dataset(val_fraction = 0.01, seed = 42, *, max_train_samples = None):
         'revision': source['revision'],
         'patterns': list(source['patterns']),
         'max_train_samples': max_train_samples,
-        'val_fraction': val_fraction,
         'seed': seed,
     }
 
@@ -410,45 +394,46 @@ def train_dataset(val_fraction = 0.01, seed = 42, *, max_train_samples = None):
 
     if _cache_is_current(manifest, train_config):
         train = load_json(manifest['train_path'])
-        validation = load_json(manifest['validation_path'])
     else:
-        complete = llava_next_instruct(max_samples = max_train_samples)
+        train_samples = llava_next_instruct()
 
-        train_samples, validation_samples = grouped_train_val_split(complete, val_fraction = val_fraction, seed = seed)
+        # Sample from the full training source when a cap is requested.
+        if max_train_samples is not None and max_train_samples < len(train_samples):
+            sample_ids = random.Random(seed).sample(sorted(train_samples), max_train_samples)
+            train_samples = {sample_id: train_samples[sample_id] for sample_id in sample_ids}
 
         train = {'llava_next': train_samples}
-        validation = {'llava_next': validation_samples}
 
         os.makedirs(configuration_directory, exist_ok = True)
         generation_directory = tempfile.mkdtemp(prefix = 'generation-', dir = configuration_directory)
         train_path = os.path.join(generation_directory, 'train.json')
-        validation_path = os.path.join(generation_directory, 'validation.json')
         save_as_json(train, train_path)
-        save_as_json(validation, validation_path)
 
         manifest = {
             'protocol': PREPROCESSING_PROTOCOL,
             'config': train_config,
             'train_samples': len(train_samples),
-            'validation_samples': len(validation_samples),
         }
 
-        for name, path in (('train', train_path), ('validation', validation_path)):
-            digest = hashlib.sha256()
-            with open(path, 'rb') as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b''):
-                    digest.update(block)
-            manifest[f'{name}_path'] = path
-            manifest[f'{name}_sha256'] = digest.hexdigest()
+        digest = hashlib.sha256()
+        with open(train_path, 'rb') as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b''):
+                digest.update(block)
+        manifest['train_path'] = train_path
+        manifest['train_sha256'] = digest.hexdigest()
 
         # Only completed generations are published; their files are never overwritten.
         save_as_json(manifest, manifest_path)
 
-        print(f'Grouped LLaVA-NeXT split: train={len(train_samples):,}, val={len(validation_samples):,}')
+        print(f'LlaVA-NeXT training samples: {len(train_samples):,}')
 
-    return CustomDataset(train), CustomDataset(validation)
+    train_set, val_set = grouped_train_val_split(CustomDataset(train), seed)
+    total = len(train_set) + len(val_set)
+    print(f'LlaVA-NeXT split: train={len(train_set):,} ({len(train_set) / total:.1%}), val={len(val_set):,} ({len(val_set) / total:.1%})')
+
+    return train_set, val_set
 
 if __name__ == '__main__':
-    train_set, validation_set = train_dataset()
+    train_set, val_set = train_dataset()
 
-    print(f'train={len(train_set):,}, val={len(validation_set):,}')
+    print(f'train={len(train_set):,}, val={len(val_set):,}')

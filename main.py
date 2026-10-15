@@ -70,12 +70,12 @@ def build_model(device, args):
 
     return processor, text_encoder, vision_encoder, interaction, moe, llm
 
-def batch_loss(model, batch, device, context_limit):
+def batch_loss(model, batch, device, context_limit, return_stats = False):
     _, question, text_inputs, image_inputs, answer = batch
     text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
     image_inputs = {key: value.to(device) for key, value in image_inputs.items()}
 
-    return model(question, text_inputs, image_inputs, answer, context_limit)
+    return model(question, text_inputs, image_inputs, answer, context_limit, return_stats = return_stats)
 
 def train(model, batch, device, context_limit):
     model.train()
@@ -86,7 +86,7 @@ def val(model, batch, device, context_limit):
     model.eval()
 
     with torch.no_grad():
-        return batch_loss(model, batch, device, context_limit)
+        return batch_loss(model, batch, device, context_limit, return_stats = True)
 
 def main(args):
     ## Random Seed
@@ -97,16 +97,8 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    ## Checkpoint
-    checkpoint = None
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location = 'cpu', weights_only = False)
-        saved_args = checkpoint['args']
-        args.clip_revision = saved_args['clip_revision']
-        args.llm_revision = saved_args['llm_revision']
-
     ## Dataset and Dataloader
-    train_set, val_set = train_dataset(args.val_fraction, args.seed, max_train_samples = args.max_train_samples)
+    train_set, val_set = train_dataset(seed = args.data_seed, max_train_samples = args.max_train_samples)
 
     ## Model Building
     processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
@@ -120,25 +112,11 @@ def main(args):
 
     ## Optimizer
     optimizer = torch.optim.AdamW((parameter for parameter in ipmoe.parameters() if parameter.requires_grad), lr = args.learning_rate)
-    start_epoch = 0
     step = 0
-    if checkpoint is not None:
-        ipmoe.load_state_dict(checkpoint['model'], strict = False)
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        start_epoch = checkpoint['epoch']
-        step = checkpoint['step']
-        random.setstate(checkpoint['random_state'])
-        np.random.set_state(checkpoint['numpy_state'])
-        torch.set_rng_state(checkpoint['torch_state'])
-        generator.set_state(checkpoint['loader_state'])
-        if device == 'cuda' and checkpoint['cuda_state'] is not None:
-            torch.cuda.set_rng_state_all(checkpoint['cuda_state'])
-        elif device == 'mps' and checkpoint['mps_state'] is not None:
-            torch.mps.set_rng_state(checkpoint['mps_state'])
 
     ## Training and Validation
     os.makedirs(args.output_dir, exist_ok = True)
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(args.epochs):
         skipped = 0
         for batch in train_loader:
             optimizer.zero_grad(set_to_none = True)
@@ -154,36 +132,40 @@ def main(args):
             skipped += len(batch[1]) - weights.size(0)
             print(f'Epoch {epoch + 1}, step {step}, loss {loss.item():.4f}')
 
+        print(f'Skipped training examples: {skipped}')
+
+        ## Validation
         val_loss = 0.0
-        val_batches = 0
+        val_tokens = 0
+        val_skipped = 0
         for batch in val_loader:
             try:
-                loss, _ = val(ipmoe, batch, device, args.context_limit)
+                loss, weights, tokens = val(ipmoe, batch, device, args.context_limit)
             except NoValidTargetsError:
+                val_skipped += len(batch[1])
                 continue
-            val_loss += loss.item()
-            val_batches += 1
 
-        mean_loss = val_loss / val_batches if val_batches else None
-        print(f'Validation batch-mean loss: {mean_loss}, skipped training examples: {skipped}')
+            val_loss += loss.item() * tokens
+            val_tokens += tokens
+            val_skipped += len(batch[1]) - weights.size(0)
+
+        mean_loss = val_loss / val_tokens if val_tokens else None
+        print(f'Validation token-mean loss: {mean_loss}, skipped validation examples: {val_skipped}')
 
         ## Save at the End of Each Epoch
         torch.save({
             'model': {name: parameter.detach().cpu() for name, parameter in ipmoe.named_parameters() if parameter.requires_grad},
-            'optimizer': optimizer.state_dict(), 'args': vars(args), 'epoch': epoch + 1, 'step': step,
+            'args': vars(args), 'epoch': epoch + 1, 'step': step,
             'protocol': PREPROCESSING_PROTOCOL, 'source': SOURCES,
-            'random_state': random.getstate(), 'numpy_state': np.random.get_state(),
-            'torch_state': torch.get_rng_state(), 'loader_state': generator.get_state(),
-            'cuda_state': torch.cuda.get_rng_state_all() if device == 'cuda' else None,
-            'mps_state': torch.mps.get_rng_state() if device == 'mps' else None,
         }, os.path.join(args.output_dir, 'checkpoint.pt.tmp'))
         os.replace(os.path.join(args.output_dir, 'checkpoint.pt.tmp'), os.path.join(args.output_dir, 'checkpoint.pt'))
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type = int, default = 42)
+    parser.add_argument('--data-seed', type = int, default = 42)
 
-    parser.add_argument('--interaction-type', default = 'bilinear')
+    parser.add_argument('--interaction-type', choices = ['bilinear'], default = 'bilinear')
 
     parser.add_argument('--patch-size', type = int, default = 16)
     parser.add_argument('--embed-dim', type = int, default = 1024)
@@ -196,17 +178,15 @@ def parse_args():
     parser.add_argument('--lora-rank', type = int, default = 64)
     parser.add_argument('--clip-revision', default = None)
     parser.add_argument('--llm-revision', default = None)
-    parser.add_argument('--attn-implementation', default = 'flash_attention_2')
+    parser.add_argument('--attn-implementation', default = 'sdpa')
 
     parser.add_argument('--gradient-checkpointing', action = argparse.BooleanOptionalAction, default = True)
     parser.add_argument('--context-limit', type = int, default = 4096)
     parser.add_argument('--batch-size', type = int, default = 1)
     parser.add_argument('--epochs', type = int, default = 1)
     parser.add_argument('--learning-rate', type = float, default = 1e-4)
-    parser.add_argument('--val-fraction', type = float, default = 0.01)
     parser.add_argument('--max-train-samples', type = int, default = None)
     parser.add_argument('--output-dir', default = 'checkpoint')
-    parser.add_argument('--resume', default = None)
     args = parser.parse_args()
 
     return args

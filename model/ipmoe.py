@@ -45,7 +45,7 @@ class IPMoE(nn.Module):
 
         return prefix, prefix_mask, weights
 
-    def forward(self, questions, text_inputs, image_inputs, answers, context_limit):
+    def forward(self, questions, text_inputs, image_inputs, answers, context_limit, return_stats = False):
         prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
         text_budget = [context_limit - length for length in prefix_mask.sum(dim = 1).tolist()]
 
@@ -59,14 +59,17 @@ class IPMoE(nn.Module):
         embeds, mask, position_ids, labels = self.llm.build_inputs(token_rows, positions, prefix, label_rows, prefix_mask = prefix_mask)
         loss = self.llm(embeds, mask, position_ids, labels)
 
+        if return_stats:
+            return loss, weights, (labels[:, 1:] != -100).sum().item()
+
         return loss, weights
 
     @torch.no_grad()
-    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32):
+    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True):
         prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
         text_budget = [context_limit - length - max_new_tokens for length in prefix_mask.sum(dim = 1).tolist()]
 
-        token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget)
+        token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget, enforce_mcq_format = enforce_mcq_format)
         embeds, mask, _, _ = self.llm.build_inputs(token_rows, positions, prefix, prefix_mask = prefix_mask)
         answers = self.llm.generate(embeds, mask, max_new_tokens = max_new_tokens)
 
