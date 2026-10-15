@@ -62,7 +62,7 @@ class DynamicRouter(nn.Module):
 
         return weights
 
-class DenseMoE(nn.Module):
+class MoE(nn.Module):
     """Keep each expert's output with its own weight for each input."""
 
     def __init__(self, in_c, self_expert, cross_expert, hybrid_expert):

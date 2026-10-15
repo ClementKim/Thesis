@@ -13,7 +13,7 @@ from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL
 from model.encoder import encoding
 from model.interaction import Interaction
 from model.experts import SelfExpert, CrossExpert, HybridExpert
-from model.router import DenseMoE
+from model.router import MoE
 from model.llm import LlamaLLM, Qwen25VLLLM, NoValidTargetsError
 
 from model.ipmoe import IPMoE
@@ -54,7 +54,7 @@ def build_model(device, args):
     hybrid_expert = HybridExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
 
     ## Router
-    moe = DenseMoE(1, self_expert, cross_expert, hybrid_expert)
+    moe = MoE(1, self_expert, cross_expert, hybrid_expert)
 
     ## LLM
     dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
