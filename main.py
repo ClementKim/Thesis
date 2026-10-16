@@ -2,9 +2,12 @@ import os
 import argparse
 import torch
 import random
+from datetime import timedelta
 
 import numpy as np
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 # Dataset
 from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL, SOURCES
@@ -66,7 +69,7 @@ def build_model(device, args):
     moe = MoE(1, self_expert, cross_expert, hybrid_expert)
 
     ## LLM
-    dtype = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    dtype = torch.bfloat16 if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
     if args.llm_type == "llama":
         llm = LlamaLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype, args.llm_revision)
@@ -79,17 +82,17 @@ def build_model(device, args):
 
     return processor, text_encoder, vision_encoder, interaction, moe, llm
 
-def batch_loss(model, batch, device, context_limit, return_stats = False):
+def batch_loss(model, batch, device, context_limit, return_stats = False, allow_empty = False):
     _, question, text_inputs, image_inputs, answer = batch
     text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
     image_inputs = {key: value.to(device) for key, value in image_inputs.items()}
 
-    return model(question, text_inputs, image_inputs, answer, context_limit, return_stats = return_stats)
+    return model(question, text_inputs, image_inputs, answer, context_limit, return_stats = return_stats, allow_empty = allow_empty)
 
-def train(model, batch, device, context_limit):
+def train(model, batch, device, context_limit, return_stats = False, allow_empty = False):
     model.train()
 
-    return batch_loss(model, batch, device, context_limit)
+    return batch_loss(model, batch, device, context_limit, return_stats, allow_empty)
 
 def val(model, batch, device, context_limit):
     model.eval()
@@ -97,26 +100,109 @@ def val(model, batch, device, context_limit):
     with torch.no_grad():
         return batch_loss(model, batch, device, context_limit, return_stats = True)
 
-def main(args):
+def setup_distributed():
+    """torchrun supplies one rank per process and one local rank per GPU."""
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+    else:
+        device = torch.device('mps' if world_size == 1 and torch.backends.mps.is_available() else 'cpu')
+
+    if world_size > 1:
+        # Allow time for rank 0 to prepare the shared dataset cache on the first run.
+        dist.init_process_group(backend = 'nccl' if device.type == 'cuda' else 'gloo',
+                                device_id = device if device.type == 'cuda' else None, timeout = timedelta(hours = 2))
+
+    return device, rank, world_size
+
+def reduce_totals(values, device):
+    if not dist.is_initialized():
+        return values
+    totals = torch.tensor(values, dtype = torch.float64, device = device)
+    dist.all_reduce(totals, op = dist.ReduceOp.SUM)
+    return totals.tolist()
+
+def train_step(model, batch, optimizer, device, context_limit):
+    """Optimize the global answer-token mean, including ranks with no valid answers."""
+    optimizer.zero_grad(set_to_none = True)
+    distributed = isinstance(model, DDP)
+    try:
+        loss, weights, tokens = train(model, batch, device, context_limit, return_stats = True, allow_empty = distributed)
+    except NoValidTargetsError:
+        return None, 0
+
+    totals = [loss.detach().item() * tokens, tokens]
+    if distributed:
+        totals = reduce_totals(totals, device)
+    loss_sum, total_tokens = totals
+    if total_tokens == 0:
+        # Complete DDP's backward bookkeeping without advancing AdamW or weight decay.
+        loss.backward()
+        return None, 0
+
+    world_size = dist.get_world_size() if distributed else 1
+    # DDP averages gradients across ranks; compensate for unequal token counts.
+    (loss * (world_size * tokens / total_tokens)).backward()
+    optimizer.step()
+
+    return loss_sum / total_tokens, weights.size(0)
+
+def evaluate(model, loader, device, context_limit):
+    """Evaluate disjoint shards without per-forward DDP communication."""
+    if isinstance(model, DDP):
+        model = model.module
+    loss_sum, tokens, skipped, seen = 0.0, 0, 0, 0
+    for batch in loader:
+        seen += len(batch[1])
+        try:
+            loss, weights, batch_tokens = val(model, batch, device, context_limit)
+        except NoValidTargetsError:
+            skipped += len(batch[1])
+            continue
+
+        loss_sum += loss.item() * batch_tokens
+        tokens += batch_tokens
+        skipped += len(batch[1]) - weights.size(0)
+
+    loss_sum, tokens, skipped, seen = reduce_totals([loss_sum, tokens, skipped, seen], device)
+    return loss_sum / tokens if tokens else None, int(skipped), int(seen)
+
+def run_training(args, device, rank, world_size):
     ## Random Seed
     seed = args.seed
     reproduce(seed)
 
-    ## Device Setting
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Using device: {device}")
+    distributed = world_size > 1
+    if rank == 0:
+        print(f'Using device: {device}, processes: {world_size}, global batch size: {args.batch_size * world_size}')
 
     ## Dataset and Dataloader
+    # Only rank 0 builds the cache; the other ranks then read the completed files.
+    if distributed and rank != 0:
+        dist.barrier()
     train_set, val_set = train_dataset(seed = args.data_seed, max_train_samples = args.max_train_samples)
+    if distributed and rank == 0:
+        dist.barrier()
 
     ## Model Building
     processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
     ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm, args.embed_dim, args.patch_size).to(device)
+    model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None,
+                broadcast_buffers = False) if distributed else ipmoe
+    # Start from identical weights, then use independent dropout streams per rank.
+    torch.manual_seed(seed + rank)
 
     generator = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = True,
+    train_sampler = DistributedSampler(train_set, num_replicas = world_size, rank = rank, seed = seed) if distributed else None
+    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = train_sampler is None, sampler = train_sampler,
                               collate_fn = make_collate_fn(processor), generator = generator)
-    val_loader = DataLoader(val_set, batch_size = args.batch_size, shuffle = False,
+    # No duplicated validation examples, even when the split is smaller than world_size.
+    val_shard = Subset(val_set, range(rank, len(val_set), world_size))
+    val_loader = DataLoader(val_shard, batch_size = args.batch_size, shuffle = False,
                             collate_fn = make_collate_fn(processor), generator = torch.Generator().manual_seed(seed))
 
     ## Optimizer
@@ -124,62 +210,66 @@ def main(args):
     step = 0
 
     ## Training and Validation
-    os.makedirs(args.output_dir, exist_ok = True)
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok = True)
     for epoch in range(args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         epoch_start_step = step
         skipped = 0
+        seen = 0
         for batch in train_loader:
-            optimizer.zero_grad(set_to_none = True)
-            try:
-                loss, weights = train(ipmoe, batch, device, args.context_limit)
-            except NoValidTargetsError:
-                skipped += len(batch[1])
+            loss, retained = train_step(model, batch, optimizer, device, args.context_limit)
+            seen += len(batch[1])
+            skipped += len(batch[1]) - retained
+            if loss is None:
                 continue
 
-            loss.backward()
-            optimizer.step()
             step += 1
-            skipped += len(batch[1]) - weights.size(0)
-            print(f'Epoch {epoch + 1}, step {step}, loss {loss.item():.4f}')
+            if rank == 0:
+                print(f'Epoch {epoch + 1}, step {step}, loss {loss:.4f}')
 
         epoch_steps = step - epoch_start_step
         if epoch_steps == 0:
             raise RuntimeError('No optimizer steps this epoch; refusing to save a new checkpoint')
 
-        print(f'Skipped training examples: {skipped}')
+        skipped, seen = (int(value) for value in reduce_totals([skipped, seen], device))
+        if rank == 0:
+            print(f'Skipped training examples: {skipped}, sampler padding: {seen - len(train_set)}')
 
         ## Validation
-        val_loss = 0.0
-        val_tokens = 0
-        val_skipped = 0
-        for batch in val_loader:
-            try:
-                loss, weights, tokens = val(ipmoe, batch, device, args.context_limit)
-            except NoValidTargetsError:
-                val_skipped += len(batch[1])
-                continue
-
-            val_loss += loss.item() * tokens
-            val_tokens += tokens
-            val_skipped += len(batch[1]) - weights.size(0)
-
-        mean_loss = val_loss / val_tokens if val_tokens else None
-        print(f'Validation token-mean loss: {mean_loss}, skipped validation examples: {val_skipped}')
+        mean_loss, val_skipped, val_seen = evaluate(ipmoe, val_loader, device, args.context_limit)
+        if rank == 0:
+            print(f'Validation token-mean loss: {mean_loss}, skipped validation examples: {val_skipped}')
 
         ## Save at the End of Each Epoch
-        torch.save({
-            'model': {name: parameter.detach().cpu() for name, parameter in ipmoe.named_parameters() if parameter.requires_grad},
-            'args': vars(args), 'epoch': epoch + 1, 'step': step,
-            'protocol': PREPROCESSING_PROTOCOL, 'source': SOURCES,
-            'optimizer_steps_this_epoch': epoch_steps,
-            'data_counts': {
-                'train_split': len(train_set), 'val_split': len(val_set),
-                'train_budget_skipped': skipped, 'val_budget_skipped': val_skipped,
-                'train_retained_this_epoch': len(train_set) - skipped,
-                'val_retained': len(val_set) - val_skipped,
-            },
-        }, os.path.join(args.output_dir, 'checkpoint.pt.tmp'))
-        os.replace(os.path.join(args.output_dir, 'checkpoint.pt.tmp'), os.path.join(args.output_dir, 'checkpoint.pt'))
+        if rank == 0:
+            torch.save({
+                'model': {name: parameter.detach().cpu() for name, parameter in ipmoe.named_parameters() if parameter.requires_grad},
+                'args': vars(args), 'epoch': epoch + 1, 'step': step,
+                'protocol': PREPROCESSING_PROTOCOL, 'source': SOURCES,
+                'world_size': world_size, 'global_batch_size': args.batch_size * world_size,
+                'optimizer_steps_this_epoch': epoch_steps,
+                'data_counts': {
+                    'train_split': len(train_set), 'val_split': len(val_set),
+                    'train_seen_this_epoch': seen, 'train_sampler_padding': seen - len(train_set),
+                    'train_budget_skipped': skipped, 'val_budget_skipped': val_skipped,
+                    'train_retained_this_epoch': seen - skipped,
+                    'val_retained': val_seen - val_skipped,
+                },
+                'val_loss': mean_loss,
+            }, os.path.join(args.output_dir, 'checkpoint.pt.tmp'))
+            os.replace(os.path.join(args.output_dir, 'checkpoint.pt.tmp'), os.path.join(args.output_dir, 'checkpoint.pt'))
+        if distributed:
+            dist.barrier()
+
+def main(args):
+    try:
+        device, rank, world_size = setup_distributed()
+        run_training(args, device, rank, world_size)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -203,7 +293,7 @@ def parse_args():
 
     parser.add_argument('--gradient-checkpointing', action = argparse.BooleanOptionalAction, default = True)
     parser.add_argument('--context-limit', type = int, default = 4096)
-    parser.add_argument('--batch-size', type = int, default = 1)
+    parser.add_argument('--batch-size', type = int, default = 1, help = 'Examples per GPU (global batch size = batch size * world size)')
     parser.add_argument('--epochs', type = int, default = 1)
     parser.add_argument('--learning-rate', type = float, default = 1e-4)
     parser.add_argument('--max-train-samples', type = int, default = None)

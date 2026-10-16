@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from .interaction import InteractionAdapter
+from .llm import NoValidTargetsError
 
 class IPMoE(nn.Module):
     def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size):
@@ -71,12 +72,21 @@ class IPMoE(nn.Module):
             lengths.append(image_tokens + interaction_tokens + 3)
         return lengths
 
-    def forward(self, questions, text_inputs, image_inputs, answers, context_limit, return_stats = False):
+    def forward(self, questions, text_inputs, image_inputs, answers, context_limit, return_stats = False, allow_empty = False):
         prefix_lengths = self._prefix_lengths(text_inputs, image_inputs)
         text_budget = [context_limit - length for length in prefix_lengths]
 
         # The LLM receives the original question and supervises only its answer.
-        token_rows, label_rows, kept_rows, positions = self.llm.tokenize_training_chats(questions, answers, max_total_tokens = text_budget)
+        try:
+            token_rows, label_rows, kept_rows, positions = self.llm.tokenize_training_chats(questions, answers, max_total_tokens = text_budget)
+        except NoValidTargetsError:
+            if not allow_empty:
+                raise
+
+            # Empty DDP ranks must still participate in every gradient reduction.
+            loss = sum(parameter.reshape(-1)[0].float() * 0 for parameter in self.parameters() if parameter.requires_grad)
+            weights = self.aux.new_empty((0, 3))
+            return (loss, weights, 0) if return_stats else (loss, weights)
 
         # The tokenizer raises NoValidTargetsError before encoding an empty selection.
         def select(inputs):
