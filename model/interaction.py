@@ -14,15 +14,12 @@ class Interaction(nn.Module):
             return torch.bmm(text, vision.transpose(1, 2))
 
 class InteractionAdapter(nn.Module):
-    """Keep the rectangular token-patch plane and embed it for the LLM prefix."""
-
     def __init__(self, embed_dim, patch_size):
         super().__init__()
 
         self.patch_embed = PatchEmbeddingLayer(1, embed_dim, None, patch_size, is_cls_token = False)
 
     def forward(self, similarity, text_mask):
-        # Rows are text tokens; columns retain the image-patch order.
         map_mask = text_mask.bool().unsqueeze(-1).expand_as(similarity)
         interaction_map = similarity.unsqueeze(1)
         interaction_tokens, token_mask = self.patch_embed(interaction_map, mask = map_mask)

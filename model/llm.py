@@ -4,6 +4,7 @@ import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
@@ -27,7 +28,6 @@ FIXED_CHAT_DATE = '13 OCT 2026'
 OPTION_LINE_RE = re.compile(r'^\s*(?:\(([A-H])\)|([A-H])(?:[\.)\:]|\s))\s*', flags = re.IGNORECASE)
 
 def extract_mcq_labels(question):
-    """Read consecutive option letters, or return [] for a regular question."""
     labels = []
 
     for line in str(question).splitlines():
@@ -47,7 +47,6 @@ def extract_mcq_labels(question):
     return labels
 
 def _format_question(question, enforce_mcq_format):
-    """Ask for one option letter when the question has multiple choices."""
     question = str(question)
     if not enforce_mcq_format:
         return question
@@ -65,22 +64,22 @@ class NoValidTargetsError(ValueError):
     pass
 
 class _ImagePrefixLLM(nn.Module):
-    """Shared prompt preparation and LoRA training for both language models."""
-
-    def __init__(self, model_name, model_class, lora_rank, attn_implementation, gradient_checkpointing, target_modules, torch_dtype = torch.float32, revision = None):
+    def __init__(self, model_name, model_class, lora_rank, attn_implementation, gradient_checkpointing, target_modules, torch_dtype = torch.float32):
         super().__init__()
 
         if lora_rank < 1:
             raise ValueError(f'lora_rank must be positive, got {lora_rank}')
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision = revision)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.tokenizer.padding_side = 'left'
         self.marker_id = self._add_marker()
 
-        model = model_class.from_pretrained(model_name, dtype = torch_dtype, revision = revision, low_cpu_mem_usage = True,
+        model = model_class.from_pretrained(model_name, 
+                                            dtype = torch_dtype, 
+                                            low_cpu_mem_usage = True,
                                             attn_implementation = attn_implementation)
 
         # Cache off for training. generate() turns it back on.
@@ -88,9 +87,13 @@ class _ImagePrefixLLM(nn.Module):
         if gradient_checkpointing:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {'use_reentrant': False})
 
-        lora_config = LoraConfig(task_type = TaskType.CAUSAL_LM, inference_mode = False,
-                                 r = lora_rank, lora_alpha = 2 * lora_rank, lora_dropout = 0.05,
+        lora_config = LoraConfig(task_type = TaskType.CAUSAL_LM, 
+                                 inference_mode = False,
+                                 r = lora_rank, 
+                                 lora_alpha = 2 * lora_rank, 
+                                 lora_dropout = 0.05,
                                  target_modules = target_modules)
+        
         self.model = get_peft_model(model, lora_config)
         self.model.print_trainable_parameters()
 
@@ -101,31 +104,29 @@ class _ImagePrefixLLM(nn.Module):
         return self.model.device
 
     def _add_marker(self):
-        """Add the marker as a single token and return its ID."""
         self.tokenizer.add_special_tokens({'additional_special_tokens': [MM_MARKER]})
         marker_id = self.tokenizer.convert_tokens_to_ids(MM_MARKER)
 
         if marker_id is None:
             raise RuntimeError('Failed to register the multimodal marker')
+        
         if self.tokenizer.unk_token_id is not None and marker_id == self.tokenizer.unk_token_id:
             raise RuntimeError('The multimodal marker became UNK')
 
         return int(marker_id)
 
     def _supports_logits_to_keep(self):
-        """Check if the model accepts logits_to_keep."""
         try:
             model = self.model.get_base_model()
             parameters = inspect.signature(model.forward).parameters
+
         except (TypeError, ValueError):
             return False
 
         return 'logits_to_keep' in parameters
 
     def _tokenize_chat(self, messages, add_generation_prompt):
-        """Tokenize the full chat, then remove the marker and record its position."""
-        token_ids = self.tokenizer.apply_chat_template(messages, tokenize = True, add_generation_prompt = add_generation_prompt,
-                                                       date_string = FIXED_CHAT_DATE, return_dict = False)
+        token_ids = self.tokenizer.apply_chat_template(messages, tokenize = True, add_generation_prompt = add_generation_prompt, date_string = FIXED_CHAT_DATE, return_dict = False)
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.tolist()
 
@@ -133,6 +134,7 @@ class _ImagePrefixLLM(nn.Module):
         if token_ids and isinstance(token_ids[0], list):
             if len(token_ids) != 1:
                 raise RuntimeError('Unexpected batched output from apply_chat_template')
+            
             token_ids = token_ids[0]
 
         token_ids = [int(token_id) for token_id in token_ids]
@@ -147,7 +149,6 @@ class _ImagePrefixLLM(nn.Module):
         return token_ids, insert_position
 
     def tokenize_training_chats(self, questions, answers, max_total_tokens = 1024):
-        """Prepare answer labels and record the samples whose prompts fit the limit."""
         if len(questions) != len(answers):
             raise ValueError('questions and answers must have the same length')
 
@@ -159,6 +160,7 @@ class _ImagePrefixLLM(nn.Module):
         for row_index, (question, answer) in enumerate(zip(questions, answers)):
             if MM_MARKER in str(question) or MM_MARKER in str(answer):
                 raise ValueError(f'Reserved multimodal marker in training text: sample={row_index}')
+            
             text_budget = max_total_tokens if isinstance(max_total_tokens, int) else max_total_tokens[row_index]
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
             assistant_message = {'role': 'assistant', 'content': str(answer)}
@@ -173,6 +175,7 @@ class _ImagePrefixLLM(nn.Module):
             prompt_length = len(prompt_ids)
             if full_ids[:prompt_length] != prompt_ids:
                 raise RuntimeError('Assistant target sequence is not prefix-aligned with the prompt')
+            
             # Keep the complete answer and its model-specific termination suffix.
             if len(full_ids) > text_budget:
                 continue
@@ -193,13 +196,13 @@ class _ImagePrefixLLM(nn.Module):
         return token_rows, label_rows, kept_rows, insert_positions
 
     def tokenize_generation_chats(self, questions, max_prompt_tokens = 2048, enforce_mcq_format = True):
-        """Prepare question prompts for generation."""
         token_rows = []
         insert_positions = []
 
         for row_index, question in enumerate(questions):
             if MM_MARKER in str(question):
                 raise ValueError(f'Reserved multimodal marker in generation question: sample={row_index}')
+            
             text_budget = max_prompt_tokens if isinstance(max_prompt_tokens, int) else max_prompt_tokens[row_index]
             question = _format_question(question, enforce_mcq_format)
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
@@ -215,7 +218,6 @@ class _ImagePrefixLLM(nn.Module):
         return token_rows, insert_positions
 
     def _insert_prefix(self, token_rows, insert_positions, prefix, label_rows, prefix_mask = None):
-        """Insert each image's features into its text embeddings and label sequence."""
         B, P, H = prefix.shape
         embed = self.model.get_input_embeddings()
         input_rows = []
@@ -232,6 +234,7 @@ class _ImagePrefixLLM(nn.Module):
             image_features = prefix[row_index]
             if prefix_mask is not None:
                 image_features = image_features[prefix_mask[row_index].bool()]
+
             image_features = image_features.to(token_embeddings.dtype)
             text_after = token_embeddings[insert_position:]
 
@@ -251,7 +254,6 @@ class _ImagePrefixLLM(nn.Module):
         return input_rows, merged_label_rows
 
     def _pad_inputs(self, input_rows, label_rows):
-        """Pad on the left and build the attention mask, positions, and optional labels."""
         max_length = max(row.size(0) for row in input_rows)
         padded_inputs = []
         padded_masks = []
@@ -281,21 +283,23 @@ class _ImagePrefixLLM(nn.Module):
 
         if label_rows is not None:
             labels = torch.stack(padded_labels, dim = 0)
+
         else:
             labels = None
 
         return input_embeds, attention_mask, position_ids, labels
 
     def build_inputs(self, token_rows, insert_positions, prefix, label_rows = None, prefix_mask = None):
-        """Insert image features (B, P, H), then return padded embeddings, masks, positions, and labels."""
         if prefix.ndim != 3:
             raise ValueError(f'prefix must have shape (B, P, H), got {tuple(prefix.shape)}')
 
         B, P, H = prefix.shape
         if len(token_rows) != B:
             raise ValueError('token_rows batch does not match prefix batch')
+        
         if len(insert_positions) != B:
             raise ValueError('insert_positions batch does not match prefix batch')
+        
         if label_rows is not None and len(label_rows) != B:
             raise ValueError('label_rows batch does not match prefix batch')
 
@@ -304,7 +308,6 @@ class _ImagePrefixLLM(nn.Module):
         return self._pad_inputs(input_rows, merged_label_rows)
 
     def forward(self, input_embeds, attention_mask, position_ids, labels, optimize = True):
-        """Compute answer-token loss, optionally calculating only the logits we need."""
         model_inputs = {
             'inputs_embeds': input_embeds,
             'attention_mask': attention_mask,
@@ -314,6 +317,7 @@ class _ImagePrefixLLM(nn.Module):
 
         if not optimize or not self.logits_to_keep_supported:
             output = self.model(**model_inputs, labels = labels)
+
             return output.loss
 
         # Each position predicts the next token. -100 labels do not contribute.
@@ -325,6 +329,7 @@ class _ImagePrefixLLM(nn.Module):
         prediction_positions = active_positions.nonzero(as_tuple = True)[0]
         if prediction_positions.numel() == 0:
             output = self.model(**model_inputs, labels = labels)
+
             return output.loss
 
         output = self.model(**model_inputs, logits_to_keep = prediction_positions)
@@ -332,6 +337,7 @@ class _ImagePrefixLLM(nn.Module):
 
         logits = output.logits.float()
         vocab_size = logits.size(-1)
+        
         logits = logits.reshape(-1, vocab_size)
         answer_labels = answer_labels.reshape(-1)
 
@@ -340,7 +346,6 @@ class _ImagePrefixLLM(nn.Module):
         return loss
 
     def generate(self, input_embeds, attention_mask, max_new_tokens = 32):
-        """Generate and decode only the new answer tokens."""
         if max_new_tokens < 1:
             raise ValueError('max_new_tokens must be positive')
 
@@ -353,22 +358,17 @@ class _ImagePrefixLLM(nn.Module):
         return [prediction.strip() for prediction in decoded]
 
 class LlamaLLM(_ImagePrefixLLM):
-    """Frozen Llama with trainable LoRA adapters and its tokenizer."""
-
-    def __init__(self, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
+    def __init__(self, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
         if llm_size not in MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(MODEL_NAMES)}')
 
         model_name = MODEL_NAMES[llm_size]
         target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
 
-        super().__init__(model_name, AutoModelForCausalLM, lora_rank, attn_implementation,
-                         gradient_checkpointing, target_modules, torch_dtype, revision)
+        super().__init__(model_name, AutoModelForCausalLM, lora_rank, attn_implementation, gradient_checkpointing, target_modules, torch_dtype)
 
 class Qwen25VLLLM(_ImagePrefixLLM):
-    """Qwen2.5-VL with decoder LoRA. Image features must already match its embedding width."""
-
-    def __init__(self, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
+    def __init__(self, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
         if llm_size not in QWEN_MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(QWEN_MODEL_NAMES)}')
 
@@ -382,12 +382,10 @@ class Qwen25VLLLM(_ImagePrefixLLM):
 
         # Our image features use sequence positions on all three Qwen MRoPE axes.
         super().__init__(model_name, Qwen2_5_VLForConditionalGeneration, lora_rank, attn_implementation,
-                         gradient_checkpointing, target_modules, torch_dtype, revision)
+                         gradient_checkpointing, target_modules, torch_dtype)
 
-def llamaAPI(device, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
-    """Build the Llama model with LoRA adapters on the given device."""
-    return LlamaLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype, revision).to(device)
+def llamaAPI(device, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+    return LlamaLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype).to(device)
 
-def qwenAPI(device, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32, revision = None):
-    """Build Qwen2.5-VL with LoRA adapters for the same image-prefix interface as Llama."""
-    return Qwen25VLLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype, revision).to(device)
+def qwenAPI(device, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+    return Qwen25VLLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype).to(device)

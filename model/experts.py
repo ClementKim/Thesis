@@ -27,6 +27,7 @@ class SelfExpert(nn.Module):
 
     def forward(self, x, mask = None):
         x, mask = self.patch_embed(x, mask)
+
         for block in self.blocks:
             x = block(x, mask)
         x = self.norm(x[:, :1])
@@ -70,6 +71,7 @@ class HybridExpert(nn.Module):
         self.depth = DEPTH
 
         self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, interaction_size, patch_size, self.is_cls_token)
+
         self.blocks = nn.Sequential(*[
             SelfAttentionBlock(embed_dim, num_heads, mlp_ratio, drop, attn_drop) if i % 2 == 0 else
             CrossAttentionBlock(embed_dim, num_heads, mlp_ratio, drop, attn_drop)
@@ -82,11 +84,14 @@ class HybridExpert(nn.Module):
     def forward(self, x, auxiliary, mask = None):
         x, mask = self.patch_embed(x, mask)
         auxiliary = auxiliary.expand(x.size(0), -1, -1)
+
         for i in range(self.depth):
             if i % 2 == 0:
                 x = self.blocks[i](x, mask)
+        
             else:
                 auxiliary = self.blocks[i](auxiliary, x, mask)
+        
         auxiliary = self.norm(auxiliary)
 
         return auxiliary

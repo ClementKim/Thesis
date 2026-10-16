@@ -1,11 +1,13 @@
 import os
-import argparse
 import torch
 import random
-from datetime import timedelta
+import argparse
 
 import numpy as np
 import torch.distributed as dist
+
+from tqdm import tqdm
+from datetime import timedelta
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
@@ -23,8 +25,8 @@ from model.ipmoe import IPMoE
 
 def reproduce(seed):
     try:
-        os.environ["PYTHONHASHSEED"] = str(seed)
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
 
         random.seed(seed)
         np.random.seed(seed)
@@ -35,7 +37,7 @@ def reproduce(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        torch.use_deterministic_algorithms(True, warn_only = True)
+        torch.use_deterministic_algorithms(True)
 
         # Allow TF32 on Ampere+ GPUs for faster matmuls
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -47,11 +49,12 @@ def reproduce(seed):
 def build_model(device, args):
     if args.embed_dim <= 0 or args.num_heads <= 0 or args.embed_dim % args.num_heads:
         raise ValueError('embed_dim must be positive and divisible by positive num_heads')
+    
     if args.patch_size <= 0:
         raise ValueError('patch_size must be positive')
 
     ## CLIP
-    processor, text_encoder, vision_encoder = encoding(args.drop, device, args.embed_dim, revision = args.clip_revision)
+    processor, text_encoder, vision_encoder = encoding(args.drop, device, args.embed_dim)
 
     vision = text_encoder.clip.config.vision_config
     if vision.image_size % vision.patch_size or vision.image_size // vision.patch_size != 24:
@@ -72,13 +75,14 @@ def build_model(device, args):
     dtype = torch.bfloat16 if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
     if args.llm_type == "llama":
-        llm = LlamaLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype, args.llm_revision)
+        llm = LlamaLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype)
 
     elif args.llm_type == "qwen":
-        llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype, args.llm_revision)
+        llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype)
 
-    args.clip_revision = getattr(text_encoder.clip.config, '_commit_hash', None) or args.clip_revision
-    args.llm_revision = getattr(llm.model.config, '_commit_hash', None) or args.llm_revision
+    # Record the loaded versions in checkpoints without exposing CLI options.
+    args.clip_revision = getattr(text_encoder.clip.config, '_commit_hash', None)
+    args.llm_revision = getattr(llm.model.config, '_commit_hash', None)
 
     return processor, text_encoder, vision_encoder, interaction, moe, llm
 
@@ -101,7 +105,6 @@ def val(model, batch, device, context_limit):
         return batch_loss(model, batch, device, context_limit, return_stats = True)
 
 def setup_distributed():
-    """torchrun supplies one rank per process and one local rank per GPU."""
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('RANK', '0'))
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
@@ -109,6 +112,7 @@ def setup_distributed():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device('cuda', local_rank)
+
     else:
         device = torch.device('mps' if world_size == 1 and torch.backends.mps.is_available() else 'cpu')
 
@@ -122,29 +126,35 @@ def setup_distributed():
 def reduce_totals(values, device):
     if not dist.is_initialized():
         return values
+    
     totals = torch.tensor(values, dtype = torch.float64, device = device)
     dist.all_reduce(totals, op = dist.ReduceOp.SUM)
+
     return totals.tolist()
 
 def train_step(model, batch, optimizer, device, context_limit):
-    """Optimize the global answer-token mean, including ranks with no valid answers."""
     optimizer.zero_grad(set_to_none = True)
     distributed = isinstance(model, DDP)
     try:
         loss, weights, tokens = train(model, batch, device, context_limit, return_stats = True, allow_empty = distributed)
+
     except NoValidTargetsError:
         return None, 0
 
     totals = [loss.detach().item() * tokens, tokens]
     if distributed:
         totals = reduce_totals(totals, device)
+
     loss_sum, total_tokens = totals
+
     if total_tokens == 0:
         # Complete DDP's backward bookkeeping without advancing AdamW or weight decay.
         loss.backward()
+
         return None, 0
 
     world_size = dist.get_world_size() if distributed else 1
+
     # DDP averages gradients across ranks; compensate for unequal token counts.
     (loss * (world_size * tokens / total_tokens)).backward()
     optimizer.step()
@@ -155,26 +165,28 @@ def evaluate(model, loader, device, context_limit):
     """Evaluate disjoint shards without per-forward DDP communication."""
     if isinstance(model, DDP):
         model = model.module
+
     loss_sum, tokens, skipped, seen = 0.0, 0, 0, 0
-    for batch in loader:
+    for batch in tqdm(loader):
         seen += len(batch[1])
+
         try:
             loss, weights, batch_tokens = val(model, batch, device, context_limit)
+
         except NoValidTargetsError:
             skipped += len(batch[1])
             continue
 
         loss_sum += loss.item() * batch_tokens
         tokens += batch_tokens
+
         skipped += len(batch[1]) - weights.size(0)
 
     loss_sum, tokens, skipped, seen = reduce_totals([loss_sum, tokens, skipped, seen], device)
     return loss_sum / tokens if tokens else None, int(skipped), int(seen)
 
 def run_training(args, device, rank, world_size):
-    ## Random Seed
     seed = args.seed
-    reproduce(seed)
 
     distributed = world_size > 1
     if rank == 0:
@@ -184,41 +196,44 @@ def run_training(args, device, rank, world_size):
     # Only rank 0 builds the cache; the other ranks then read the completed files.
     if distributed and rank != 0:
         dist.barrier()
+
     train_set, val_set = train_dataset(seed = args.data_seed, max_train_samples = args.max_train_samples)
+
     if distributed and rank == 0:
         dist.barrier()
 
     ## Model Building
     processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
     ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm, args.embed_dim, args.patch_size).to(device)
-    model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None,
-                broadcast_buffers = False) if distributed else ipmoe
+    model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None, broadcast_buffers = False) if distributed else ipmoe
+    
     # Start from identical weights, then use independent dropout streams per rank.
     torch.manual_seed(seed + rank)
 
     generator = torch.Generator().manual_seed(seed)
     train_sampler = DistributedSampler(train_set, num_replicas = world_size, rank = rank, seed = seed) if distributed else None
-    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = train_sampler is None, sampler = train_sampler,
-                              collate_fn = make_collate_fn(processor), generator = generator)
+    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = train_sampler is None, sampler = train_sampler, collate_fn = make_collate_fn(processor), generator = generator)
+    
     # No duplicated validation examples, even when the split is smaller than world_size.
     val_shard = Subset(val_set, range(rank, len(val_set), world_size))
-    val_loader = DataLoader(val_shard, batch_size = args.batch_size, shuffle = False,
-                            collate_fn = make_collate_fn(processor), generator = torch.Generator().manual_seed(seed))
+    val_loader = DataLoader(val_shard, batch_size = args.batch_size, shuffle = False, collate_fn = make_collate_fn(processor), generator = torch.Generator().manual_seed(seed))
 
     ## Optimizer
-    optimizer = torch.optim.AdamW((parameter for parameter in ipmoe.parameters() if parameter.requires_grad), lr = args.learning_rate)
     step = 0
+    optimizer = torch.optim.AdamW((parameter for parameter in ipmoe.parameters() if parameter.requires_grad), lr = args.learning_rate)
 
     ## Training and Validation
     if rank == 0:
         os.makedirs(args.output_dir, exist_ok = True)
+    
     for epoch in range(args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        epoch_start_step = step
-        skipped = 0
+
         seen = 0
-        for batch in train_loader:
+        skipped = 0
+        epoch_start_step = step
+        for batch in tqdm(train_loader):
             loss, retained = train_step(model, batch, optimizer, device, args.context_limit)
             seen += len(batch[1])
             skipped += len(batch[1]) - retained
@@ -226,7 +241,7 @@ def run_training(args, device, rank, world_size):
                 continue
 
             step += 1
-            if rank == 0:
+            if rank == 0 and not (step % 1000):
                 print(f'Epoch {epoch + 1}, step {step}, loss {loss:.4f}')
 
         epoch_steps = step - epoch_start_step
@@ -260,13 +275,17 @@ def run_training(args, device, rank, world_size):
                 'val_loss': mean_loss,
             }, os.path.join(args.output_dir, 'checkpoint.pt.tmp'))
             os.replace(os.path.join(args.output_dir, 'checkpoint.pt.tmp'), os.path.join(args.output_dir, 'checkpoint.pt'))
+    
         if distributed:
             dist.barrier()
 
 def main(args):
     try:
+        # Configure determinism before CUDA or the process group is initialized.
+        reproduce(args.seed)
         device, rank, world_size = setup_distributed()
         run_training(args, device, rank, world_size)
+    
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -287,9 +306,7 @@ def parse_args():
     parser.add_argument('--llm-type', choices = ['llama', 'qwen'], default = 'llama')
     parser.add_argument('--llm-size', type = int, default = 3)
     parser.add_argument('--lora-rank', type = int, default = 64)
-    parser.add_argument('--clip-revision', default = None)
-    parser.add_argument('--llm-revision', default = None)
-    parser.add_argument('--attn-implementation', default = 'sdpa')
+    parser.add_argument('--attn-implementation', default = 'flash_attention_2')
 
     parser.add_argument('--gradient-checkpointing', action = argparse.BooleanOptionalAction, default = True)
     parser.add_argument('--context-limit', type = int, default = 4096)

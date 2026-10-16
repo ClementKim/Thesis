@@ -48,7 +48,9 @@ class PatchEmbeddingLayer(nn.Module):
             position[:, 0::2] = angles.sin()
             position[:, 1::2] = angles[:, :D // 2].cos()
             positions.append(position)
+
         positional_embedding = torch.cat((positions[0][:, None].expand(-1, W, -1), positions[1][None].expand(H, -1, -1)), dim = -1)
+
         x = x + positional_embedding.reshape(1, H * W, self.embed_dim).to(x.dtype)
         x = x.masked_fill(~mask[:, :, None], 0)
 
@@ -87,13 +89,16 @@ class MultiHeadSelfAttention(nn.Module):
         v = self.v(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
         scores = q @ k.transpose(2, 3) * self.scale
+
         if mask is not None:
             scores = scores.masked_fill(~mask[:, None, None, :], -torch.inf)
+
         A = F.softmax(scores, dim = -1)
 
         SA = (A @ v).transpose(1, 2).reshape(B, N, D)
 
         out = self.dropout(self.o(SA))
+
         if mask is not None:
             out = out.masked_fill(~mask[:, :, None], 0)
 
@@ -128,6 +133,7 @@ class MultiHeadCrossAttention(nn.Module):
         v = self.v(context).reshape(B, M, self.num_heads, self.head_dim).transpose(1, 2)
 
         scores = q @ k.transpose(2, 3) * self.scale
+
         if mask is not None:
             scores = scores.masked_fill(~mask[:, None, None, :], -torch.inf)
 
@@ -170,6 +176,7 @@ class SelfAttentionBlock(nn.Module):
     def forward(self, x, mask = None):
         x = x + self.attn(self.norm1(x), mask)
         x = x + self.mlp(self.norm2(x))
+        
         if mask is not None:
             x = x.masked_fill(~mask.to(device = x.device, dtype = torch.bool)[:, :, None], 0)
 

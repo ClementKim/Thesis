@@ -9,12 +9,10 @@ from transformers import CLIPConfig, CLIPModel, CLIPProcessor
 MODEL_NAME = 'openai/clip-vit-large-patch14-336'
 
 class CLIPEncoder(nn.Module):
-    """One frozen backbone shared by the text and image encoders."""
-
-    def __init__(self, revision = None):
+    def __init__(self):
         super().__init__()
 
-        self.model = CLIPModel.from_pretrained(MODEL_NAME, revision = revision)
+        self.model = CLIPModel.from_pretrained(MODEL_NAME)
 
         for parameter in self.model.parameters():
             parameter.requires_grad = False
@@ -25,8 +23,6 @@ class CLIPEncoder(nn.Module):
         return self.model.config
 
 class TextEncoder(nn.Module):
-    """Split long questions into CLIP chunks, then join their content tokens."""
-
     def __init__(self, CLIP, drop, out_dim = None, chunk_batch_size = 64, add_chunk_position = True):
         super().__init__()
 
@@ -54,7 +50,6 @@ class TextEncoder(nn.Module):
 
     @staticmethod
     def _chunk_position_encoding(num_chunks, dim, device, dtype):
-        """Sinusoidal positions identify which chunk each token came from."""
         positions = torch.arange(num_chunks, device = device, dtype = torch.float32).unsqueeze(1)
         frequency_indices = torch.arange(0, dim, 2, device = device, dtype = torch.float32)
         frequencies = torch.exp(-math.log(10000.0) * frequency_indices / max(dim, 1))
@@ -70,7 +65,6 @@ class TextEncoder(nn.Module):
         return encoding.to(dtype = dtype)
 
     def _make_chunks(self, input_ids, attention_mask):
-        """Build fixed-length chunks and record (sample, length, chunk index)."""
         config = self.clip.config.text_config
         max_length = config.max_position_embeddings
         content_window = max_length - 2  # Reserve BOS and EOS in each chunk.
@@ -119,7 +113,6 @@ class TextEncoder(nn.Module):
         return torch.stack(chunk_id_rows), torch.stack(chunk_mask_rows), chunk_info
 
     def _encode_chunks(self, chunk_ids, chunk_mask):
-        """Limit CLIP activation memory by encoding a few chunks at a time."""
         encoded_batches = []
 
         for start in range(0, chunk_ids.size(0), self.chunk_batch_size):
@@ -132,7 +125,6 @@ class TextEncoder(nn.Module):
         return torch.cat(encoded_batches, dim = 0)
 
     def _join_chunks(self, encoded_chunks, chunk_info, batch_size, mask_dtype):
-        """Restore each question's token sequence and pad the batch."""
         if self.add_chunk_position:
             num_positions = max(chunk_index for _, _, chunk_index in chunk_info) + 1
             chunk_positions = self._chunk_position_encoding(num_chunks = num_positions, dim = self.out_dim,
@@ -163,8 +155,6 @@ class TextEncoder(nn.Module):
         return self._join_chunks(encoded_chunks, chunk_info, input_ids.size(0), attention_mask.dtype)
 
 class VisionEncoder(nn.Module):
-    """Project CLIP patch tokens while preserving the image's spatial layout."""
-
     def __init__(self, CLIP, drop, out_dim = None):
         super().__init__()
 
@@ -174,8 +164,7 @@ class VisionEncoder(nn.Module):
         if out_dim is None:
             out_dim = projection_dim
 
-        self.mlp = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, feature_dim),
-                                 nn.GELU(), nn.Dropout(drop), nn.Linear(feature_dim, out_dim))
+        self.mlp = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, feature_dim), nn.GELU(), nn.Dropout(drop), nn.Linear(feature_dim, out_dim))
 
     def train(self, mode = True):
         super().train(mode)
@@ -191,12 +180,13 @@ class VisionEncoder(nn.Module):
 
         return self.mlp(patches)
 
-def encoding(drop, device, out_dim = None, revision = None):
-    """Build the processor and both encoders with one shared CLIP backbone."""
-    image_size = int(CLIPConfig.from_pretrained(MODEL_NAME, revision = revision).vision_config.image_size)
+def encoding(drop, device, out_dim = None):
+    image_size = int(CLIPConfig.from_pretrained(MODEL_NAME).vision_config.image_size)
+
     # Keep the whole image; center cropping could remove regions in the question.
-    processor = CLIPProcessor.from_pretrained(MODEL_NAME, revision = revision, use_fast = True, size = {'height': image_size, 'width': image_size}, do_center_crop = False)
-    clip = CLIPEncoder(revision).to(device)
+    processor = CLIPProcessor.from_pretrained(MODEL_NAME, use_fast = True, size = {'height': image_size, 'width': image_size}, do_center_crop = False)
+
+    clip = CLIPEncoder().to(device)
     text_encoder = TextEncoder(clip, drop, out_dim).to(device)
     vision_encoder = VisionEncoder(clip, drop, out_dim).to(device)
 
