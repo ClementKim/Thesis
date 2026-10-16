@@ -16,7 +16,7 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'simoe-llava-next-singleturn-v4'
+PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v5'
 CACHE_DIRECTORY = 'dataset/cache'
 
 # Pin the dataset version so repeated builds use the same source data.
@@ -125,7 +125,7 @@ def encoded_image_bytes(image_ref):
         path = image_ref.get('path')
         if path and os.path.exists(path):
             with open(path, 'rb') as handle:
-                return handle.read()
+                return handle.read() or None
 
         return None
 
@@ -229,9 +229,16 @@ def llava_next_instruct(*, max_samples = None):
             counters['malformed'] += 1
             continue
 
+        # The multimodal insertion marker is reserved by the application.
+        if '<|ipmoe_mm|>' in question or '<|ipmoe_mm|>' in answer:
+            counters['reserved_marker'] += 1
+            continue
+
         # Different sources may use the same ID.
         source_name = str(item.get('data_source') or 'unknown')
-        source_id = item.get('id') or index
+        source_id = item.get('id')
+        if source_id is None or source_id == '':
+            source_id = index
         sample_id = f'{source_name}/{source_id}'
         if sample_id in samples:
             counters['duplicate_id'] += 1

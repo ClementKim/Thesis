@@ -42,8 +42,17 @@ def reproduce(seed):
         raise RuntimeError(f"Failed to set random seed: {e}")
 
 def build_model(device, args):
+    if args.embed_dim <= 0 or args.num_heads <= 0 or args.embed_dim % args.num_heads:
+        raise ValueError('embed_dim must be positive and divisible by positive num_heads')
+    if args.patch_size <= 0:
+        raise ValueError('patch_size must be positive')
+
     ## CLIP
     processor, text_encoder, vision_encoder = encoding(args.drop, device, args.embed_dim, revision = args.clip_revision)
+
+    vision = text_encoder.clip.config.vision_config
+    if vision.image_size % vision.patch_size or vision.image_size // vision.patch_size != 24:
+        raise ValueError('The router requires a 24 by 24 CLIP patch grid')
 
     ## Interaction Matrix Constructor
     interaction = Interaction(args.interaction_type)
@@ -117,6 +126,7 @@ def main(args):
     ## Training and Validation
     os.makedirs(args.output_dir, exist_ok = True)
     for epoch in range(args.epochs):
+        epoch_start_step = step
         skipped = 0
         for batch in train_loader:
             optimizer.zero_grad(set_to_none = True)
@@ -131,6 +141,10 @@ def main(args):
             step += 1
             skipped += len(batch[1]) - weights.size(0)
             print(f'Epoch {epoch + 1}, step {step}, loss {loss.item():.4f}')
+
+        epoch_steps = step - epoch_start_step
+        if epoch_steps == 0:
+            raise RuntimeError('No optimizer steps this epoch; refusing to save a new checkpoint')
 
         print(f'Skipped training examples: {skipped}')
 
@@ -157,6 +171,13 @@ def main(args):
             'model': {name: parameter.detach().cpu() for name, parameter in ipmoe.named_parameters() if parameter.requires_grad},
             'args': vars(args), 'epoch': epoch + 1, 'step': step,
             'protocol': PREPROCESSING_PROTOCOL, 'source': SOURCES,
+            'optimizer_steps_this_epoch': epoch_steps,
+            'data_counts': {
+                'train_split': len(train_set), 'val_split': len(val_set),
+                'train_budget_skipped': skipped, 'val_budget_skipped': val_skipped,
+                'train_retained_this_epoch': len(train_set) - skipped,
+                'val_retained': len(val_set) - val_skipped,
+            },
         }, os.path.join(args.output_dir, 'checkpoint.pt.tmp'))
         os.replace(os.path.join(args.output_dir, 'checkpoint.pt.tmp'), os.path.join(args.output_dir, 'checkpoint.pt'))
 
@@ -173,7 +194,7 @@ def parse_args():
     parser.add_argument('--mlp-ratio', type = float, default = 2.0)
     parser.add_argument('--drop', type = float, default = 0.0)
     parser.add_argument('--attn-drop', type = float, default = 0.0)
-    parser.add_argument('--llm-type', default = 'llama')
+    parser.add_argument('--llm-type', choices = ['llama', 'qwen'], default = 'llama')
     parser.add_argument('--llm-size', type = int, default = 3)
     parser.add_argument('--lora-rank', type = int, default = 64)
     parser.add_argument('--clip-revision', default = None)

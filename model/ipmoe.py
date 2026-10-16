@@ -45,16 +45,48 @@ class IPMoE(nn.Module):
 
         return prefix, prefix_mask, weights
 
+    def _prefix_lengths(self, text_inputs, image_inputs):
+        vision = self.vision_encoder.clip.config.vision_config
+        image_size, patch_size = int(vision.image_size), int(vision.patch_size)
+        if image_size % patch_size:
+            raise ValueError('CLIP image size must be divisible by its patch size')
+        if tuple(image_inputs['pixel_values'].shape[-2:]) != (image_size, image_size):
+            raise ValueError('Prefix prediction requires the configured square CLIP image size')
+        image_tokens = (image_size // patch_size) ** 2
+        p = self.interaction_adapter.patch_embed.patch_size
+        if p <= 0:
+            raise ValueError('Interaction patch size must be positive')
+        cfg = self.text_encoder.clip.config.text_config
+        if cfg.bos_token_id is None or cfg.eos_token_id is None:
+            raise ValueError('CLIP text configuration must define BOS and EOS token IDs')
+        lengths = []
+        for ids, mask in zip(text_inputs['input_ids'], text_inputs['attention_mask']):
+            content = ids[mask.bool()]
+            if content.numel() and content[0].item() == cfg.bos_token_id:
+                content = content[1:]
+            if content.numel() and content[-1].item() == cfg.eos_token_id:
+                content = content[:-1]
+            text_tokens = max(content.numel(), 1)  # Empty chunk retains its EOS.
+            interaction_tokens = ((text_tokens + p - 1) // p) * ((image_tokens + p - 1) // p)
+            lengths.append(image_tokens + interaction_tokens + 3)
+        return lengths
+
     def forward(self, questions, text_inputs, image_inputs, answers, context_limit, return_stats = False):
-        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
-        text_budget = [context_limit - length for length in prefix_mask.sum(dim = 1).tolist()]
+        prefix_lengths = self._prefix_lengths(text_inputs, image_inputs)
+        text_budget = [context_limit - length for length in prefix_lengths]
 
         # The LLM receives the original question and supervises only its answer.
         token_rows, label_rows, kept_rows, positions = self.llm.tokenize_training_chats(questions, answers, max_total_tokens = text_budget)
-        kept = torch.tensor(kept_rows, dtype = torch.long, device = prefix.device)
-        prefix = prefix.index_select(0, kept)
-        prefix_mask = prefix_mask.index_select(0, kept)
-        weights = weights.index_select(0, kept)
+
+        # The tokenizer raises NoValidTargetsError before encoding an empty selection.
+        def select(inputs):
+            return {key: value.index_select(0, torch.tensor(kept_rows, device = value.device, dtype = torch.long))
+                    for key, value in inputs.items()}
+
+        prefix, prefix_mask, weights = self.encode_prefix(select(text_inputs), select(image_inputs))
+        expected = [prefix_lengths[index] for index in kept_rows]
+        if prefix_mask.sum(dim = 1).tolist() != expected:
+            raise RuntimeError('Predicted prefix lengths disagree with encoded prefix lengths')
 
         embeds, mask, position_ids, labels = self.llm.build_inputs(token_rows, positions, prefix, label_rows, prefix_mask = prefix_mask)
         loss = self.llm(embeds, mask, position_ids, labels)
@@ -66,6 +98,8 @@ class IPMoE(nn.Module):
 
     @torch.no_grad()
     def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True):
+        if self.training:
+            raise RuntimeError('Call model.eval() before generation')
         prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
         text_budget = [context_limit - length - max_new_tokens for length in prefix_mask.sum(dim = 1).tolist()]
 

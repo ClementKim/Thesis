@@ -18,7 +18,7 @@ QWEN_MODEL_NAMES = {
 }
 
 # Placeholder token that marks where the image features go.
-MM_MARKER = '<|simoe_mm|>'
+MM_MARKER = '<|ipmoe_mm|>'
 
 # Fixed date so the chat template always gives the same tokens.
 FIXED_CHAT_DATE = '13 OCT 2026'
@@ -157,6 +157,8 @@ class _ImagePrefixLLM(nn.Module):
         insert_positions = []
 
         for row_index, (question, answer) in enumerate(zip(questions, answers)):
+            if MM_MARKER in str(question) or MM_MARKER in str(answer):
+                raise ValueError(f'Reserved multimodal marker in training text: sample={row_index}')
             text_budget = max_total_tokens if isinstance(max_total_tokens, int) else max_total_tokens[row_index]
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
             assistant_message = {'role': 'assistant', 'content': str(answer)}
@@ -196,6 +198,8 @@ class _ImagePrefixLLM(nn.Module):
         insert_positions = []
 
         for row_index, question in enumerate(questions):
+            if MM_MARKER in str(question):
+                raise ValueError(f'Reserved multimodal marker in generation question: sample={row_index}')
             text_budget = max_prompt_tokens if isinstance(max_prompt_tokens, int) else max_prompt_tokens[row_index]
             question = _format_question(question, enforce_mcq_format)
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
