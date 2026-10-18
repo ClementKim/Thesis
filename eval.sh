@@ -11,7 +11,7 @@ export PYTHONPATH="$PWD/VLMEvalKit${PYTHONPATH:+:$PYTHONPATH}"
 for SEED in 42 43 44; do
     PYTHONHASHSEED="$SEED" torchrun --standalone --nproc-per-node=gpu eval.py \
         --model IPMoE \
-        --data MME \
+        --data NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG \
         --work-dir evaluation/seed_$SEED \
         --judge exact_matching \
         "$@" || exit $?

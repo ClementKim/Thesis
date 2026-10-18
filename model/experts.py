@@ -8,7 +8,7 @@ else:
 DEPTH = 12
 
 class SelfExpert(nn.Module):
-    def __init__(self, interaction_size, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
+    def __init__(self, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
         super().__init__()
 
         self.num_features = self.embed_dim = embed_dim
@@ -16,7 +16,7 @@ class SelfExpert(nn.Module):
         self.is_cls_token = is_cls_token
         self.depth = DEPTH
 
-        self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, interaction_size, patch_size, self.is_cls_token)
+        self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, patch_size, self.is_cls_token)
         self.blocks = nn.Sequential(*[
             SelfAttentionBlock(embed_dim, num_heads, mlp_ratio, drop, attn_drop)
             for _ in range(self.depth)
@@ -30,12 +30,14 @@ class SelfExpert(nn.Module):
 
         for block in self.blocks:
             x = block(x, mask)
-        x = self.norm(x[:, :1])
 
-        return x
+        x = self.norm(x)
+        x = x.masked_fill(~mask[:, :, None], 0)
+
+        return x, mask
 
 class CrossExpert(nn.Module):
-    def __init__(self, interaction_size, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
+    def __init__(self, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
         super().__init__()
 
         self.num_features = self.embed_dim = embed_dim
@@ -43,7 +45,7 @@ class CrossExpert(nn.Module):
         self.is_cls_token = is_cls_token
         self.depth = DEPTH
 
-        self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, interaction_size, patch_size, self.is_cls_token)
+        self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, patch_size, self.is_cls_token)
         self.blocks = nn.Sequential(*[
             CrossAttentionBlock(embed_dim, num_heads, mlp_ratio, drop, attn_drop)
             for _ in range(self.depth)
@@ -55,14 +57,17 @@ class CrossExpert(nn.Module):
     def forward(self, x, auxiliary, mask = None):
         x, mask = self.patch_embed(x, mask)
         auxiliary = auxiliary.expand(x.size(0), -1, -1)
-        for block in self.blocks:
-            auxiliary = block(auxiliary, x, mask)
-        auxiliary = self.norm(auxiliary)
 
-        return auxiliary
+        for block in self.blocks:
+            x = block(x, auxiliary, mask)
+
+        x = self.norm(x)
+        x = x.masked_fill(~mask[:, :, None], 0)
+
+        return x, mask
 
 class HybridExpert(nn.Module):
-    def __init__(self, interaction_size, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
+    def __init__(self, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):
         super().__init__()
 
         self.num_features = self.embed_dim = embed_dim
@@ -70,7 +75,7 @@ class HybridExpert(nn.Module):
         self.is_cls_token = is_cls_token
         self.depth = DEPTH
 
-        self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, interaction_size, patch_size, self.is_cls_token)
+        self.patch_embed = PatchEmbeddingLayer(in_c, embed_dim, patch_size, self.is_cls_token)
 
         self.blocks = nn.Sequential(*[
             SelfAttentionBlock(embed_dim, num_heads, mlp_ratio, drop, attn_drop) if i % 2 == 0 else
@@ -90,8 +95,9 @@ class HybridExpert(nn.Module):
                 x = self.blocks[i](x, mask)
         
             else:
-                auxiliary = self.blocks[i](auxiliary, x, mask)
+                x = self.blocks[i](x, auxiliary, mask)
         
-        auxiliary = self.norm(auxiliary)
+        x = self.norm(x)
+        x = x.masked_fill(~mask[:, :, None], 0)
 
-        return auxiliary
+        return x, mask

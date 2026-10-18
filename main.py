@@ -64,9 +64,9 @@ def build_model(device, args):
     interaction = Interaction(args.interaction_type)
 
     ## Experts
-    self_expert = SelfExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, True)
-    cross_expert = CrossExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
-    hybrid_expert = HybridExpert(None, args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
+    self_expert = SelfExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
+    cross_expert = CrossExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
+    hybrid_expert = HybridExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
 
     ## Router
     moe = MoE(1, self_expert, cross_expert, hybrid_expert)
@@ -79,10 +79,6 @@ def build_model(device, args):
 
     elif args.llm_type == "qwen":
         llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype)
-
-    # Record the loaded versions in checkpoints without exposing CLI options.
-    args.clip_revision = getattr(text_encoder.clip.config, '_commit_hash', None)
-    args.llm_revision = getattr(llm.model.config, '_commit_hash', None)
 
     return processor, text_encoder, vision_encoder, interaction, moe, llm
 
@@ -204,7 +200,7 @@ def run_training(args, device, rank, world_size):
 
     ## Model Building
     processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
-    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm, args.embed_dim, args.patch_size).to(device)
+    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm, args.embed_dim, args.patch_size, args.num_aux_tokens).to(device)
     model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None, broadcast_buffers = False) if distributed else ipmoe
     
     # Start from identical weights, then use independent dropout streams per rank.
@@ -300,6 +296,7 @@ def parse_args():
     parser.add_argument('--patch-size', type = int, default = 16)
     parser.add_argument('--embed-dim', type = int, default = 1024)
     parser.add_argument('--num-heads', type = int, default = 16)
+    parser.add_argument('--num-aux-tokens', type = int, default = 32)
     parser.add_argument('--mlp-ratio', type = float, default = 2.0)
     parser.add_argument('--drop', type = float, default = 0.0)
     parser.add_argument('--attn-drop', type = float, default = 0.0)

@@ -16,7 +16,7 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v5'
+PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v6'
 CACHE_DIRECTORY = 'dataset/cache'
 
 # Pin the dataset version so repeated builds use the same source data.
@@ -25,6 +25,8 @@ SOURCES = {
         'repo': 'lmms-lab/LLaVA-NeXT-Data',
         'revision': 'dff8edfca0f16f9b4f1407331f6659aa881fc016',
         'patterns': ('data/train-*.parquet',),
+        'expected_shards': 250,
+        'expected_rows': 779289,
     },
 }
 
@@ -201,15 +203,15 @@ def _first_user_assistant_pair(conversations):
     return '', ''
 
 def llava_next_instruct(*, max_samples = None):
-    """Build {sample_id: record}, skipping missing images, incomplete pairs, and duplicate IDs."""
+    """Build records, skipping missing images, incomplete pairs, and identical examples within each source."""
     directory = 'dataset/llava-next/images'
-    columns = ('id', 'image', 'conversations', 'data_source')
+    columns = ('image', 'conversations', 'data_source')
 
     samples = {}
     written = set()
     counters = defaultdict(int)
 
-    for index, item in enumerate(iter_rows('llava_next', columns, desc = 'llava-next')):
+    for item in iter_rows('llava_next', columns, desc = 'llava-next'):
         if max_samples is not None and counters['accepted'] >= max_samples:
             break
 
@@ -234,14 +236,15 @@ def llava_next_instruct(*, max_samples = None):
             counters['reserved_marker'] += 1
             continue
 
-        # Different sources may use the same ID.
+        # Retain different questions and answers even when a source reuses its IDs.
         source_name = str(item.get('data_source') or 'unknown')
-        source_id = item.get('id')
-        if source_id is None or source_id == '':
-            source_id = index
-        sample_id = f'{source_name}/{source_id}'
+        content = [hashlib.sha256(raw).hexdigest(), question, answer]
+        content_digest = hashlib.sha256(
+            json.dumps(content, ensure_ascii = False, separators = (',', ':')).encode('utf-8')
+        ).hexdigest()
+        sample_id = f'{source_name}/{content_digest}'
         if sample_id in samples:
-            counters['duplicate_id'] += 1
+            counters['duplicate_sample'] += 1
             continue
 
         image_path = persist_image(raw, directory, written)

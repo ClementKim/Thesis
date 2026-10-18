@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PatchEmbeddingLayer(nn.Module):
-    def __init__(self, in_channels, embed_dim, img_size, patch_size, is_cls_token = True):
+    def __init__(self, in_channels, embed_dim, patch_size, is_cls_token = True):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -192,7 +192,11 @@ class CrossAttentionBlock(nn.Module):
         self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
 
     def forward(self, x, auxiliary, mask = None):
-        x = x + self.attn(self.norm1(x), auxiliary, mask)
+        x = x + self.attn(self.norm1(x), auxiliary)
         x = x + self.mlp(self.norm2(x))
+
+        if mask is not None:
+            mask = mask.to(device = x.device, dtype = torch.bool)
+            x = x.masked_fill(~mask[:, :, None], 0)
 
         return x

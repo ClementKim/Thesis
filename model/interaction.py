@@ -17,7 +17,7 @@ class InteractionAdapter(nn.Module):
     def __init__(self, embed_dim, patch_size):
         super().__init__()
 
-        self.patch_embed = PatchEmbeddingLayer(1, embed_dim, None, patch_size, is_cls_token = False)
+        self.patch_embed = PatchEmbeddingLayer(1, embed_dim, patch_size, is_cls_token = False)
 
     def forward(self, similarity, text_mask):
         map_mask = text_mask.bool().unsqueeze(-1).expand_as(similarity)

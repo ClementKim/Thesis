@@ -5,8 +5,11 @@ from .interaction import InteractionAdapter
 from .llm import NoValidTargetsError
 
 class IPMoE(nn.Module):
-    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size):
+    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size, num_aux_tokens):
         super().__init__()
+
+        if num_aux_tokens < 2:
+            raise ValueError('num_aux_tokens must be at least 2')
 
         self.processor = processor
         self.text_encoder = text_encoder
@@ -15,8 +18,8 @@ class IPMoE(nn.Module):
         self.moe = moe
         self.llm = llm
 
-        ## Auxiliary Token
-        self.aux = nn.Parameter(torch.randn(1, 1, embed_dim))
+        ## Auxiliary Tokens
+        self.aux = nn.Parameter(torch.randn(1, num_aux_tokens, embed_dim))
 
         ## Interaction Map and LLM Projection Heads
         self.interaction_adapter = InteractionAdapter(embed_dim, patch_size)
@@ -36,13 +39,12 @@ class IPMoE(nn.Module):
         interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
 
         # Route to one self, one cross, and one hybrid expert.
-        expert_outputs, weights = self.moe(interaction_map, self.aux, mask = map_mask)
+        expert_outputs, expert_mask, weights = self.moe(interaction_map, self.aux, map_mask)
 
         # Pass image, interaction, and each weighted expert output to the LLM.
-        prefix = torch.cat([self.image_head(image_features), self.interaction_head(interaction_tokens),
-                            self.expert_head(expert_outputs)], dim = 1)
-        image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = prefix.device)
-        expert_mask = torch.ones(expert_outputs.shape[:2], dtype = torch.bool, device = prefix.device)
+        image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
+
+        prefix = torch.cat([self.image_head(image_features), self.interaction_head(interaction_tokens), self.expert_head(expert_outputs)], dim = 1)
         prefix_mask = torch.cat([image_mask, token_mask, expert_mask], dim = 1)
 
         return prefix, prefix_mask, weights
@@ -80,7 +82,7 @@ class IPMoE(nn.Module):
         
             text_tokens = max(content.numel(), 1)  # Empty chunk retains its EOS.
             interaction_tokens = ((text_tokens + p - 1) // p) * ((image_tokens + p - 1) // p)
-            lengths.append(image_tokens + interaction_tokens + 3)
+            lengths.append(image_tokens + 4 * interaction_tokens)
         
         return lengths
 

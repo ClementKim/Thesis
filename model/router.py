@@ -74,19 +74,21 @@ class MoE(nn.Module):
         self.hybrid_expert = hybrid_expert
 
     def forward(self, x, auxiliary, mask = None):
-        """Return (B, 3, D) features and (B, 3) weights in Self, Cross, Hybrid order."""
+        """Return (B, 3N, D) tokens, (B, 3N) masks, and (B, 3) weights."""
         weights = self.router(x, mask)
 
-        self_output = self.self_expert(x, mask)
-        cross_output = self.cross_expert(x, auxiliary, mask)
-        hybrid_output = self.hybrid_expert(x, auxiliary, mask)
+        self_output, self_mask = self.self_expert(x, mask)
+        cross_output, cross_mask = self.cross_expert(x, auxiliary, mask)
+        hybrid_output, hybrid_mask = self.hybrid_expert(x, auxiliary, mask)
 
-        # All experts must produce the same (B, 1, D) shape.
+        # All experts must produce the same (B, N, D) shape.
         expert_outputs = torch.stack([self_output, cross_output, hybrid_output], dim = 1)
+        expert_masks = torch.stack([self_mask, cross_mask, hybrid_mask], dim = 1)
 
         # Apply each sample's expert weights to all its tokens and features.
         out = expert_outputs * weights[:, :, None, None]
         # Keep the weighted outputs as separate tokens for the LLM.
         out = out.flatten(1, 2)
+        out_mask = expert_masks.flatten(1, 2)
 
-        return out, weights
+        return out, out_mask, weights
