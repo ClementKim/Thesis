@@ -1,6 +1,7 @@
 import functools
 import glob
 import hashlib
+import io
 import json
 import os
 import random
@@ -16,7 +17,7 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v6'
+PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v7'
 CACHE_DIRECTORY = 'dataset/cache'
 
 # Pin the dataset version so repeated builds use the same source data.
@@ -82,6 +83,16 @@ def parquet_files(name):
     if not files:
         raise RuntimeError(f'No parquet shards for {repo!r} under {local_directory!r}')
 
+    # A local fallback can be incomplete, so compare it with the pinned revision.
+    expected_shards = source['expected_shards']
+    if len(files) != expected_shards:
+        raise RuntimeError(f'Expected {expected_shards} parquet shards for {repo!r}, found {len(files)} under {local_directory!r}')
+
+    expected_rows = source['expected_rows']
+    rows = sum(pq.ParquetFile(path).metadata.num_rows for path in files)
+    if rows != expected_rows:
+        raise RuntimeError(f'Expected {expected_rows:,} rows for {repo!r}, found {rows:,}')
+
     return files
 
 def iter_rows(name, columns, *, desc = None, batch_size = 64):
@@ -146,6 +157,16 @@ def _extension(raw):
     # PIL can identify other formats when it opens the file.
     return '.img'
 
+def _decodes(raw):
+    """Decode the whole image once. PIL's verify() misses truncated JPEGs."""
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            image.load()
+        return True
+
+    except Exception:
+        return False
+
 def _prepare_directory(directory):
     """Spread images across 256 folders to avoid one very large directory."""
     if directory in _PREPARED_DIRECTORIES:
@@ -156,9 +177,8 @@ def _prepare_directory(directory):
 
     _PREPARED_DIRECTORIES.add(directory)
 
-def persist_image(raw, directory, written):
+def persist_image(raw, digest, directory, written):
     """Save the original bytes once per image. Identical bytes share a path."""
-    digest = hashlib.sha256(raw).hexdigest()
     _prepare_directory(directory)
     path = os.path.join(directory, digest[:2], f'{digest}{_extension(raw)}')
 
@@ -184,6 +204,9 @@ def _first_user_assistant_pair(conversations):
     question = None
 
     for turn in conversations:
+        if not isinstance(turn, Mapping):
+            continue
+
         role = turn.get('from', turn.get('role', ''))
         value = turn.get('value', turn.get('content', ''))
         role = str(role).strip().lower()
@@ -202,7 +225,7 @@ def _first_user_assistant_pair(conversations):
 
     return '', ''
 
-def llava_next_instruct(*, max_samples = None):
+def llava_next_instruct():
     """Build records, skipping missing images, incomplete pairs, and identical examples within each source."""
     directory = 'dataset/llava-next/images'
     columns = ('image', 'conversations', 'data_source')
@@ -212,9 +235,6 @@ def llava_next_instruct(*, max_samples = None):
     counters = defaultdict(int)
 
     for item in iter_rows('llava_next', columns, desc = 'llava-next'):
-        if max_samples is not None and counters['accepted'] >= max_samples:
-            break
-
         raw = encoded_image_bytes(item.get('image'))
         if raw is None:
             counters['no_image'] += 1
@@ -238,7 +258,8 @@ def llava_next_instruct(*, max_samples = None):
 
         # Retain different questions and answers even when a source reuses its IDs.
         source_name = str(item.get('data_source') or 'unknown')
-        content = [hashlib.sha256(raw).hexdigest(), question, answer]
+        image_digest = hashlib.sha256(raw).hexdigest()
+        content = [image_digest, question, answer]
         content_digest = hashlib.sha256(
             json.dumps(content, ensure_ascii = False, separators = (',', ':')).encode('utf-8')
         ).hexdigest()
@@ -247,7 +268,12 @@ def llava_next_instruct(*, max_samples = None):
             counters['duplicate_sample'] += 1
             continue
 
-        image_path = persist_image(raw, directory, written)
+        # Images already in `written` were decoded when they were first saved.
+        if image_digest not in written and not _decodes(raw):
+            counters['undecodable'] += 1
+            continue
+
+        image_path = persist_image(raw, image_digest, directory, written)
         samples[sample_id] = {
             'question': question,
             'answer': answer,
@@ -262,7 +288,7 @@ def llava_next_instruct(*, max_samples = None):
     if not samples:
         raise RuntimeError('No LLaVA-NeXT samples survived filtering')
 
-    return samples
+    return samples, dict(counters)
 
 class CustomDataset(data.Dataset):
     """Index cached samples and load each image only when it is requested."""
@@ -382,7 +408,13 @@ def grouped_train_val_split(dataset, seed = 42):
     return data.Subset(dataset, train_indices), data.Subset(dataset, sorted(val_indices))
 
 def train_dataset(seed = 42, *, max_train_samples = None):
-    """Load the cached source samples, then split them by image into train and validation."""
+    """Load the cached source samples, then split them by image into train and validation.
+
+    max_train_samples caps the samples before the split, so it covers train and validation together.
+    """
+    if max_train_samples is not None and max_train_samples < 2:
+        raise ValueError(f'max_train_samples must be at least 2 for a train/validation split, got {max_train_samples}')
+
     # Changing any of these settings requires a new cache.
     source = SOURCES['llava_next']
     train_config = {
@@ -391,7 +423,8 @@ def train_dataset(seed = 42, *, max_train_samples = None):
         'revision': source['revision'],
         'patterns': list(source['patterns']),
         'max_train_samples': max_train_samples,
-        'seed': seed,
+        # The seed only changes the cache when it selects a capped subset.
+        'seed': seed if max_train_samples is not None else None,
     }
 
     cache_key = hashlib.sha256(json.dumps(train_config, sort_keys = True).encode('utf-8')).hexdigest()
@@ -402,10 +435,21 @@ def train_dataset(seed = 42, *, max_train_samples = None):
     except (ValueError, OSError):
         manifest = None
 
+    train = None
     if _cache_is_current(manifest, train_config):
         train = load_json(manifest['train_path'])
-    else:
-        train_samples = llava_next_instruct()
+
+        # The JSON only stores paths, so confirm the images are still on disk.
+        if not all(os.path.exists(sample['img_path']) for samples in train.values() for sample in samples.values()):
+            print('Cached images are missing; rebuilding the cache')
+            train = None
+
+        else:
+            counts = [f'{key}={value:,}' for key, value in sorted(manifest.get('filter_counts', {}).items())]
+            print('[llava-next] cached ' + ', '.join(counts))
+
+    if train is None:
+        train_samples, filter_counts = llava_next_instruct()
 
         # Sample from the full training source when a cap is requested.
         if max_train_samples is not None and max_train_samples < len(train_samples):
@@ -423,6 +467,7 @@ def train_dataset(seed = 42, *, max_train_samples = None):
             'protocol': PREPROCESSING_PROTOCOL,
             'config': train_config,
             'train_samples': len(train_samples),
+            'filter_counts': filter_counts,
         }
 
         digest = hashlib.sha256()
