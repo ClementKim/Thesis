@@ -276,15 +276,16 @@ def run_training(args, device, rank, world_size):
             dist.barrier()
 
 def main(args):
-    try:
-        # Configure determinism before CUDA or the process group is initialized.
-        reproduce(args.seed)
-        device, rank, world_size = setup_distributed()
-        run_training(args, device, rank, world_size)
-    
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+    # Configure determinism before CUDA or the process group is initialized.
+    reproduce(args.seed)
+    device, rank, world_size = setup_distributed()
+    run_training(args, device, rank, world_size)
+
+    # Tear down only after a clean run. On a failing rank, destroy_process_group() blocks while the other
+    # ranks wait inside a collective, which hides the traceback until the NCCL timeout. Exiting instead
+    # lets torchrun stop the job and report the error immediately.
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 def parse_args():
     parser = argparse.ArgumentParser()

@@ -17,8 +17,12 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v7'
+PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v8'
 CACHE_DIRECTORY = 'dataset/cache'
+
+# Skip answers cut off at the source model's 2,048-token limit (about 10K characters). These looping
+# generations are poor targets, and one of them in a batch of 8 needs about 20 GiB for the logits.
+MAX_ANSWER_CHARACTERS = 8000
 
 # Pin the dataset version so repeated builds use the same source data.
 SOURCES = {
@@ -226,7 +230,7 @@ def _first_user_assistant_pair(conversations):
     return '', ''
 
 def llava_next_instruct():
-    """Build records, skipping missing images, incomplete pairs, and identical examples within each source."""
+    """Build records, skipping missing images, incomplete pairs, overlong answers, and identical examples within each source."""
     directory = 'dataset/llava-next/images'
     columns = ('image', 'conversations', 'data_source')
 
@@ -249,6 +253,11 @@ def llava_next_instruct():
 
         if not question or not answer:
             counters['malformed'] += 1
+            continue
+
+        # Truncated generations repeat themselves until the source model's length limit.
+        if len(answer) > MAX_ANSWER_CHARACTERS:
+            counters['overlong_answer'] += 1
             continue
 
         # The multimodal insertion marker is reserved by the application.
