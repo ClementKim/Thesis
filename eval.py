@@ -137,7 +137,9 @@ def main():
 
     seed = int(os.environ['PYTHONHASHSEED'])
     reproduce(seed)
-    run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = f'checkpoint/seed_{seed}/checkpoint.pt')
+    checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/seed_{seed}/checkpoint.pt')
+    checkpoint_path = os.path.abspath(checkpoint_path)
+    run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path)
 
     run.load_env()
     run_checked(run, run.parse_args(), distributed)

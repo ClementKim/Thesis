@@ -11,6 +11,8 @@ from datetime import timedelta
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
+from ablation import ABLATIONS, configure_ablation
+
 # Dataset
 from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL, SOURCES
 
@@ -47,6 +49,8 @@ def reproduce(seed):
         raise RuntimeError(f"Failed to set random seed: {e}")
 
 def build_model(device, args):
+    ablation = configure_ablation(args)
+
     if args.embed_dim <= 0 or args.num_heads <= 0 or args.embed_dim % args.num_heads:
         raise ValueError('embed_dim must be positive and divisible by positive num_heads')
     
@@ -69,7 +73,7 @@ def build_model(device, args):
     hybrid_expert = HybridExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
 
     ## Router
-    moe = MoE(1, self_expert, cross_expert, hybrid_expert)
+    moe = MoE(1, self_expert, cross_expert, hybrid_expert, router_mode = ablation['router_mode'])
 
     ## LLM
     dtype = torch.bfloat16 if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
@@ -200,7 +204,8 @@ def run_training(args, device, rank, world_size):
 
     ## Model Building
     processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
-    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm, args.embed_dim, args.patch_size, args.num_aux_tokens).to(device)
+    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm,
+                  args.embed_dim, args.patch_size, args.num_aux_tokens, ablation = args.ablation_config).to(device)
     model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None, broadcast_buffers = False) if distributed else ipmoe
     
     # Start from identical weights, then use independent dropout streams per rank.
@@ -292,6 +297,7 @@ def parse_args():
     parser.add_argument('--data-seed', type = int, default = 42)
 
     parser.add_argument('--interaction-type', choices = ['bilinear'], default = 'bilinear')
+    parser.add_argument('--ablation', choices = list(ABLATIONS), default = 'full')
 
     parser.add_argument('--patch-size', type = int, default = 16)
     parser.add_argument('--embed-dim', type = int, default = 1024)
@@ -311,8 +317,11 @@ def parse_args():
     parser.add_argument('--epochs', type = int, default = 1)
     parser.add_argument('--learning-rate', type = float, default = 1e-4)
     parser.add_argument('--max-train-samples', type = int, default = None)
-    parser.add_argument('--output-dir', default = 'checkpoint')
+    parser.add_argument('--output-dir', default = None)
     args = parser.parse_args()
+
+    if args.output_dir is None:
+        args.output_dir = 'checkpoint' if args.ablation == 'full' else os.path.join('checkpoint', 'ablations', args.ablation, f'seed_{args.seed}')
 
     return args
 
