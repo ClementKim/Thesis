@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 
+from ablation import ABLATIONS, select_interaction_map
+
 from .interaction import InteractionAdapter
 from .llm import NoValidTargetsError
 
 class IPMoE(nn.Module):
-    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size, num_aux_tokens):
+    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size, num_aux_tokens, ablation = None):
         super().__init__()
 
         if num_aux_tokens < 2:
@@ -17,6 +19,12 @@ class IPMoE(nn.Module):
         self.interaction = interaction
         self.moe = moe
         self.llm = llm
+
+        self.ablation = dict(ABLATIONS['full'] if ablation is None else ablation)
+        if self.ablation not in ABLATIONS.values():
+            raise ValueError('Unsupported ablation configuration')
+        if self.moe.router_mode != self.ablation['router_mode']:
+            raise ValueError('Router mode differs from the ablation configuration')
 
         ## Auxiliary Tokens
         self.aux = nn.Parameter(torch.randn(1, num_aux_tokens, embed_dim))
@@ -38,8 +46,10 @@ class IPMoE(nn.Module):
         similarity = self.interaction(text_features, image_features)
         interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
 
-        # Route to one self, one cross, and one hybrid expert.
-        expert_outputs, expert_mask, weights = self.moe(interaction_map, self.aux, map_mask)
+        # Keep the direct interaction prefix intact and select the other paths independently.
+        expert_map = select_interaction_map(interaction_map, self.ablation['expert_map'])
+        router_map = select_interaction_map(interaction_map, self.ablation['router_map'])
+        expert_outputs, expert_mask, weights = self.moe(expert_map, self.aux, map_mask, router_x = router_map)
 
         # Pass image, interaction, and each weighted expert output to the LLM.
         image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)

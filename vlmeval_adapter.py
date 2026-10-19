@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 from vlmeval.vlm.base import BaseModel
 
+from ablation import configure_ablation
 from main import build_model
 from model.ipmoe import IPMoE
 
@@ -23,6 +24,7 @@ class IPMoEVLMEval(BaseModel):
         if not hasattr(args, 'num_aux_tokens'):
             raise ValueError('Checkpoint is missing num_aux_tokens')
 
+        configure_ablation(args, checkpoint = True)
         args.gradient_checkpointing = False
 
         self.context_limit = args.context_limit
@@ -32,7 +34,8 @@ class IPMoEVLMEval(BaseModel):
         processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(self.device, args)
         self.processor = processor
         self.model = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm,
-                           args.embed_dim, args.patch_size, args.num_aux_tokens).to(self.device)
+                           args.embed_dim, args.patch_size, args.num_aux_tokens,
+                           ablation = args.ablation_config).to(self.device)
 
         ## Load Trained Parameters
         parameters = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}

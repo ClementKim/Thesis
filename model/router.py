@@ -65,17 +65,37 @@ class DynamicRouter(nn.Module):
 class MoE(nn.Module):
     """Keep each expert's output with its own weight for each input."""
 
-    def __init__(self, in_c, self_expert, cross_expert, hybrid_expert):
+    def __init__(self, in_c, self_expert, cross_expert, hybrid_expert, router_mode = 'learned'):
         super().__init__()
 
+        if router_mode not in ('learned', 'uniform', 'static'):
+            raise ValueError(f'Unsupported router mode: {router_mode!r}')
+
+        # Construct the original router in every arm to preserve subsequent initialization.
         self.router = DynamicRouter(in_c, num_experts = 3)
         self.self_expert = self_expert
         self.cross_expert = cross_expert
         self.hybrid_expert = hybrid_expert
+        self.router_mode = router_mode
 
-    def forward(self, x, auxiliary, mask = None):
+        if router_mode != 'learned':
+            self.router.requires_grad_(False)
+
+        if router_mode == 'static':
+            self.router_logits = nn.Parameter(torch.zeros(3))
+        else:
+            self.register_parameter('router_logits', None)
+
+    def forward(self, x, auxiliary, mask = None, router_x = None):
         """Return (B, 3N, D) tokens, (B, 3N) masks, and (B, 3) weights."""
-        weights = self.router(x, mask)
+        router_x = x if router_x is None else router_x
+
+        if self.router_mode == 'uniform':
+            weights = x.new_full((x.size(0), 3), 1.0 / 3.0)
+        elif self.router_mode == 'static':
+            weights = F.softmax(self.router_logits, dim = -1).unsqueeze(0).expand(x.size(0), -1)
+        else:
+            weights = self.router(router_x, mask)
 
         self_output, self_mask = self.self_expert(x, mask)
         cross_output, cross_mask = self.cross_expert(x, auxiliary, mask)
