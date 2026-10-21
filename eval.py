@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from functools import partial
 from pathlib import Path
@@ -69,13 +70,31 @@ def benchmark_failures(run, run_dir, model_name, datasets, expected_indices, mod
     return failures
 
 
+def use_completion_tokens(wrapper):
+    """Give GPT-6 judges the request format VLMEvalKit reserves for o-series and GPT-5 models."""
+    original_init = wrapper.__init__
+
+    def init(self, *positional, **kwargs):
+        original_init(self, *positional, **kwargs)
+        # These models reject max_tokens and any temperature other than the default.
+        if 'gpt-6' in self.model:
+            self.is_max_completion_tokens = True
+
+    wrapper.__init__ = init
+
+
 def run_checked(run, args, distributed):
     """Finish toolkit cleanup, then make recorded benchmark failures fatal."""
+    from vlmeval.api.base import BaseAPI
+
     run_dirs = {}
     expected_indices = {}
+    judge_fallbacks = []
     current_model = None
+    current_dataset = None
     original_status = run.upsert_run_status
     original_build = run.build_dataset_from_spec
+    original_working = BaseAPI.working
 
     def record_run(run_dir, **fields):
         nonlocal current_model
@@ -91,13 +110,25 @@ def run_checked(run, args, distributed):
         return result
 
     def record_dataset(spec, *positional, **kwargs):
+        nonlocal current_dataset
         dataset = original_build(spec, *positional, **kwargs)
+        current_dataset = spec.dataset_alias_name
         if run.RANK == 0 and current_model is not None and dataset is not None:
             expected_indices[current_model, spec.dataset_alias_name] = list(dataset.data['index'])
         return dataset
 
+    def record_working(judge):
+        # After a failed check, datasets score by exact matching but still label results with the judge.
+        # Copied judge files would hide the fallback again, so re-judging must reuse predictions only.
+        working = original_working(judge)
+        if not working:
+            judge_fallbacks.append(f'{current_model} / {current_dataset}: judge {args.judge!r} failed its health check '
+                                   'and was replaced by exact matching; re-judge with --mode eval --reuse-aux infer')
+        return working
+
     run.upsert_run_status = record_run
     run.build_dataset_from_spec = record_dataset
+    BaseAPI.working = record_working
     try:
         if args.api_mode:
             run.run_api_mode(args)
@@ -119,11 +150,13 @@ def run_checked(run, args, distributed):
                     failures.append(f'{model_name}: missing run status for this invocation')
                     continue
                 failures.extend(benchmark_failures(run, root, model_name, args.data or [], expected_indices, args.mode))
+            failures.extend(judge_fallbacks)
             if failures:
                 raise RuntimeError('Evaluation failed:\n' + '\n'.join(f'- {failure}' for failure in failures))
     finally:
         run.upsert_run_status = original_status
         run.build_dataset_from_spec = original_build
+        BaseAPI.working = original_working
         if distributed.is_initialized():
             distributed.destroy_process_group()
 
@@ -133,6 +166,7 @@ def main():
     from VLMEvalKit import run
     import torch.distributed as distributed
     from main import reproduce
+    from vlmeval.api import OpenAIWrapper
     from vlmeval_adapter import IPMoEVLMEval
 
     seed = int(os.environ['PYTHONHASHSEED'])
@@ -140,6 +174,10 @@ def main():
     checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/seed_{seed}/checkpoint.pt')
     checkpoint_path = os.path.abspath(checkpoint_path)
     run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path)
+
+    use_completion_tokens(OpenAIWrapper)
+    # OpenAIWrapper logs the judge's API key at INFO, which would reach the console and run logs.
+    logging.getLogger('vlmeval.api.gpt').setLevel(logging.WARNING)
 
     run.load_env()
     run_checked(run, run.parse_args(), distributed)
