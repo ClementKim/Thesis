@@ -17,12 +17,19 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 # Change this when the preprocessing rules change to rebuild the caches.
-PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-singleturn-v8'
+PREPROCESSING_PROTOCOL = 'ipmoe-llava-next-multiturn-v9'
 CACHE_DIRECTORY = 'dataset/cache'
 
 # Skip answers cut off at the source model's 2,048-token limit (about 10K characters). These looping
 # generations are poor targets, and one of them in a batch of 8 needs about 20 GiB for the logits.
 MAX_ANSWER_CHARACTERS = 8000
+
+# Grounding conversations average about 15 turns; capping each conversation keeps them
+# from dominating the mixture (about 1.7M samples instead of 4.7M).
+MAX_TURNS_PER_CONVERSATION = 3
+
+# A fixed validation size; 10% of the multi-turn data would cost hours per epoch.
+MAX_VALIDATION_SAMPLES = 2000
 
 # Pin the dataset version so repeated builds use the same source data.
 SOURCES = {
@@ -203,8 +210,9 @@ def persist_image(raw, digest, directory, written):
 
     return path
 
-def _first_user_assistant_pair(conversations):
-    """Keep the first nonempty user question and the next nonempty assistant answer."""
+def _user_assistant_pairs(conversations):
+    """Pair each nonempty user question with the next nonempty assistant answer."""
+    pairs = []
     question = None
 
     for turn in conversations:
@@ -219,18 +227,28 @@ def _first_user_assistant_pair(conversations):
         if not value:
             continue
 
+        # A question with no answer is replaced by the next one.
         if role in {'human', 'user'}:
-            if question is not None:
-                return '', ''
             question = value
 
         elif question is not None and role in {'gpt', 'assistant'}:
-            return question, value
+            pairs.append((question, value))
+            question = None
 
-    return '', ''
+    return pairs
+
+def _clean_question(question):
+    # The model inserts image features itself, so remove the old marker.
+    question = re.sub(r'<\s*image\s*>', ' ', question, flags = re.IGNORECASE)
+    question = question.replace('\r\n', '\n').replace('\r', '\n')
+
+    return re.sub(r'[^\S\n]+', ' ', question).strip()
 
 def llava_next_instruct():
-    """Build records, skipping missing images, incomplete pairs, overlong answers, and identical examples within each source."""
+    """Build one record per question-answer turn, skipping missing images, incomplete pairs, overlong answers, and identical examples within each source.
+
+    At most MAX_TURNS_PER_CONVERSATION turns are kept per conversation.
+    """
     directory = 'dataset/llava-next/images'
     columns = ('image', 'conversations', 'data_source')
 
@@ -244,52 +262,62 @@ def llava_next_instruct():
             counters['no_image'] += 1
             continue
 
-        question, answer = _first_user_assistant_pair(item.get('conversations') or [])
-
-        # The model inserts image features itself, so remove the old marker.
-        question = re.sub(r'<\s*image\s*>', ' ', question, flags = re.IGNORECASE)
-        question = question.replace('\r\n', '\n').replace('\r', '\n')
-        question = re.sub(r'[^\S\n]+', ' ', question).strip()
-
-        if not question or not answer:
+        pairs = _user_assistant_pairs(item.get('conversations') or [])
+        if not pairs:
             counters['malformed'] += 1
             continue
 
-        # Truncated generations repeat themselves until the source model's length limit.
-        if len(answer) > MAX_ANSWER_CHARACTERS:
-            counters['overlong_answer'] += 1
-            continue
-
-        # The multimodal insertion marker is reserved by the application.
-        if '<|ipmoe_mm|>' in question or '<|ipmoe_mm|>' in answer:
-            counters['reserved_marker'] += 1
-            continue
-
-        # Retain different questions and answers even when a source reuses its IDs.
-        source_name = str(item.get('data_source') or 'unknown')
         image_digest = hashlib.sha256(raw).hexdigest()
-        content = [image_digest, question, answer]
-        content_digest = hashlib.sha256(
-            json.dumps(content, ensure_ascii = False, separators = (',', ':')).encode('utf-8')
-        ).hexdigest()
-        sample_id = f'{source_name}/{content_digest}'
-        if sample_id in samples:
-            counters['duplicate_sample'] += 1
-            continue
 
         # Images already in `written` were decoded when they were first saved.
         if image_digest not in written and not _decodes(raw):
             counters['undecodable'] += 1
             continue
 
-        image_path = persist_image(raw, image_digest, directory, written)
-        samples[sample_id] = {
-            'question': question,
-            'answer': answer,
-            'img_path': image_path,
-        }
+        turns = []
+        for question, answer in pairs:
+            question = _clean_question(question)
+            if not question:
+                counters['malformed'] += 1
+                continue
 
-        counters['accepted'] += 1
+            # Truncated generations repeat themselves until the source model's length limit.
+            if len(answer) > MAX_ANSWER_CHARACTERS:
+                counters['overlong_answer'] += 1
+                continue
+
+            # The multimodal insertion marker is reserved by the application.
+            if '<|ipmoe_mm|>' in question or '<|ipmoe_mm|>' in answer:
+                counters['reserved_marker'] += 1
+                continue
+
+            turns.append((question, answer))
+
+        # Seed from the image so every rebuild keeps the same turns.
+        if len(turns) > MAX_TURNS_PER_CONVERSATION:
+            counters['turn_cap'] += len(turns) - MAX_TURNS_PER_CONVERSATION
+            turns = random.Random(image_digest).sample(turns, MAX_TURNS_PER_CONVERSATION)
+
+        # Retain different questions and answers even when a source reuses its IDs.
+        source_name = str(item.get('data_source') or 'unknown')
+        for question, answer in turns:
+            content = [image_digest, question, answer]
+            content_digest = hashlib.sha256(
+                json.dumps(content, ensure_ascii = False, separators = (',', ':')).encode('utf-8')
+            ).hexdigest()
+            sample_id = f'{source_name}/{content_digest}'
+            if sample_id in samples:
+                counters['duplicate_sample'] += 1
+                continue
+
+            image_path = persist_image(raw, image_digest, directory, written)
+            samples[sample_id] = {
+                'question': question,
+                'answer': answer,
+                'img_path': image_path,
+            }
+
+            counters['accepted'] += 1
 
     counts = [f'{key}={value:,}' for key, value in sorted(counters.items())]
     print('[llava-next] ' + ', '.join(counts))
@@ -388,7 +416,7 @@ def _cache_is_current(manifest, config):
     return digest.hexdigest() == manifest.get('train_sha256')
 
 def grouped_train_val_split(dataset, seed = 42):
-    """Keep each image in one set, targeting 90% training and 10% validation."""
+    """Keep each image in one set, targeting 10% validation up to MAX_VALIDATION_SAMPLES."""
     groups = defaultdict(list)
     for index, image_path in enumerate(dataset.image_paths):
         groups[image_path].append(index)
@@ -398,10 +426,10 @@ def grouped_train_val_split(dataset, seed = 42):
 
     image_paths = sorted(groups)
     random.Random(seed).shuffle(image_paths)
-    target = max(1, round(len(dataset) * 0.1))
+    target = max(1, min(round(len(dataset) * 0.1), MAX_VALIDATION_SAMPLES))
     val_indices = []
 
-    # Add whole image groups only when they bring validation closer to 10%.
+    # Add whole image groups only when they bring validation closer to the target.
     for image_path in image_paths:
         indices = groups[image_path]
         if abs(len(val_indices) + len(indices) - target) < abs(len(val_indices) - target):

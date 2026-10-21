@@ -1,13 +1,32 @@
+import string
 from argparse import Namespace
 from collections.abc import Mapping
 
+import pandas as pd
 import torch
 from PIL import Image
+from vlmeval.dataset.image_mcq import CVBench, ImageMCQDataset
+from vlmeval.dataset.image_yorn import ImageYORNDataset
 from vlmeval.vlm.base import BaseModel
 
 from ablation import configure_ablation
 from main import build_model
 from model.ipmoe import IPMoE
+
+# Instructions copied from the LLaVA-NeXT training questions so evaluation prompts match training.
+MCQ_INSTRUCTION = "Answer with the option's letter from the given choices directly."
+SHORT_ANSWER_INSTRUCTION = 'Answer the question using a single word or phrase.'
+
+# Plain question-and-options datasets; subclasses with their own prompts (e.g. NaturalBench) keep them.
+MCQ_DATASETS = set(ImageMCQDataset.supported_datasets()) | set(CVBench.supported_datasets())
+YORN_DATASETS = set(ImageYORNDataset.supported_datasets())
+
+def _option_text(value):
+    # Option columns with blanks load as floats, which would turn a count of 1 into "1.0".
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value)
 
 class IPMoEVLMEval(BaseModel):
     INTERLEAVE = False
@@ -64,6 +83,25 @@ class IPMoEVLMEval(BaseModel):
                 parameter.copy_(saved[name])
 
         self.model.eval()
+
+    def use_custom_prompt(self, dataset):
+        return dataset in MCQ_DATASETS or dataset in YORN_DATASETS
+
+    def build_prompt(self, line, dataset = None):
+        image_paths = self.dump_image(line, dataset)
+        if not isinstance(image_paths, list):
+            image_paths = [image_paths]
+
+        # Same layout as training: hint, question, "A. option" lines, then the instruction.
+        if dataset in MCQ_DATASETS:
+            hint = line['hint'] if 'hint' in line and not pd.isna(line['hint']) else None
+            options = [f'{key}. {_option_text(line[key])}' for key in string.ascii_uppercase if key in line and not pd.isna(line[key])]
+            prompt = '\n'.join([*([hint] if hint else []), line['question'], *options, MCQ_INSTRUCTION])
+
+        else:
+            prompt = f"{line['question']}\n{SHORT_ANSWER_INSTRUCTION}"
+
+        return [dict(type = 'image', value = path) for path in image_paths] + [dict(type = 'text', value = prompt)]
 
     @torch.inference_mode()
     def generate_inner(self, message, dataset = None):

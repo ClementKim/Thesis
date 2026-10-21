@@ -10,6 +10,7 @@ from tqdm import tqdm
 from datetime import timedelta
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
+from transformers import get_cosine_schedule_with_warmup
 
 from ablation import ABLATIONS, configure_ablation
 
@@ -132,14 +133,14 @@ def reduce_totals(values, device):
 
     return totals.tolist()
 
-def train_step(model, batch, optimizer, device, context_limit):
+def train_step(model, batch, optimizer, scheduler, device, context_limit, max_grad_norm):
     optimizer.zero_grad(set_to_none = True)
     distributed = isinstance(model, DDP)
     try:
         loss, weights, tokens = train(model, batch, device, context_limit, return_stats = True, allow_empty = distributed)
 
     except NoValidTargetsError:
-        return None, 0
+        return None, 0, None
 
     totals = [loss.detach().item() * tokens, tokens]
     if distributed:
@@ -151,15 +152,17 @@ def train_step(model, batch, optimizer, device, context_limit):
         # Complete DDP's backward bookkeeping without advancing AdamW or weight decay.
         loss.backward()
 
-        return None, 0
+        return None, 0, None
 
     world_size = dist.get_world_size() if distributed else 1
 
     # DDP averages gradients across ranks; compensate for unequal token counts.
     (loss * (world_size * tokens / total_tokens)).backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()
+    scheduler.step()
 
-    return loss_sum / total_tokens, weights.size(0)
+    return loss_sum / total_tokens, weights.size(0), grad_norm.item()
 
 def evaluate(model, loader, device, context_limit):
     """Evaluate disjoint shards without per-forward DDP communication."""
@@ -213,15 +216,21 @@ def run_training(args, device, rank, world_size):
 
     generator = torch.Generator().manual_seed(seed)
     train_sampler = DistributedSampler(train_set, num_replicas = world_size, rank = rank, seed = seed) if distributed else None
-    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = train_sampler is None, sampler = train_sampler, collate_fn = make_collate_fn(processor), generator = generator)
+    # Workers decode images and run the CLIP processor while the GPU trains on the previous batch.
+    loader_options = {'num_workers': args.num_workers, 'persistent_workers': args.num_workers > 0}
+    train_loader = DataLoader(train_set, batch_size = args.batch_size, shuffle = train_sampler is None, sampler = train_sampler, collate_fn = make_collate_fn(processor), generator = generator, **loader_options)
     
     # No duplicated validation examples, even when the split is smaller than world_size.
     val_shard = Subset(val_set, range(rank, len(val_set), world_size))
-    val_loader = DataLoader(val_shard, batch_size = args.batch_size, shuffle = False, collate_fn = make_collate_fn(processor), generator = torch.Generator().manual_seed(seed))
+    val_loader = DataLoader(val_shard, batch_size = args.batch_size, shuffle = False, collate_fn = make_collate_fn(processor), generator = torch.Generator().manual_seed(seed), **loader_options)
 
     ## Optimizer
     step = 0
     optimizer = torch.optim.AdamW((parameter for parameter in ipmoe.parameters() if parameter.requires_grad), lr = args.learning_rate)
+
+    # Linear warmup, then cosine decay to zero over the planned optimizer steps.
+    total_steps = args.epochs * len(train_loader)
+    scheduler = get_cosine_schedule_with_warmup(optimizer, round(total_steps * args.warmup_ratio), total_steps)
 
     ## Training and Validation
     if rank == 0:
@@ -235,7 +244,7 @@ def run_training(args, device, rank, world_size):
         skipped = 0
         epoch_start_step = step
         for batch in tqdm(train_loader):
-            loss, retained = train_step(model, batch, optimizer, device, args.context_limit)
+            loss, retained, grad_norm = train_step(model, batch, optimizer, scheduler, device, args.context_limit, args.max_grad_norm)
             seen += len(batch[1])
             skipped += len(batch[1]) - retained
             if loss is None:
@@ -243,7 +252,7 @@ def run_training(args, device, rank, world_size):
 
             step += 1
             if rank == 0 and not (step % 1000):
-                print(f'Epoch {epoch + 1}, step {step}, loss {loss:.4f}')
+                print(f'Epoch {epoch + 1}, step {step}, loss {loss:.4f}, lr {scheduler.get_last_lr()[0]:.2e}, grad norm {grad_norm:.2f}')
 
         epoch_steps = step - epoch_start_step
         if epoch_steps == 0:
@@ -317,7 +326,10 @@ def parse_args():
     parser.add_argument('--batch-size', type = int, default = 1, help = 'Examples per GPU (global batch size = batch size * world size)')
     parser.add_argument('--epochs', type = int, default = 1)
     parser.add_argument('--learning-rate', type = float, default = 1e-4)
+    parser.add_argument('--warmup-ratio', type = float, default = 0.03)
+    parser.add_argument('--max-grad-norm', type = float, default = 1.0)
     parser.add_argument('--max-train-samples', type = int, default = None)
+    parser.add_argument('--num-workers', type = int, default = 4, help = 'DataLoader worker processes per GPU')
     parser.add_argument('--output-dir', default = None)
     args = parser.parse_args()
 

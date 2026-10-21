@@ -7,6 +7,9 @@ ABLATIONS = {
     'expert_mean': {'router_mode': 'learned', 'expert_map': 'spatial_mean', 'router_map': 'full'},
     'router_mean': {'router_mode': 'learned', 'expert_map': 'full', 'router_map': 'spatial_mean'},
     'both_mean': {'router_mode': 'learned', 'expert_map': 'spatial_mean', 'router_map': 'spatial_mean'},
+    # Only the projected CLIP patches reach the LLM; tests whether the interaction path helps at all.
+    # Read with .get('prefix', 'full') so the other arms and their saved checkpoints keep their meaning.
+    'image_only': {'router_mode': 'learned', 'expert_map': 'full', 'router_map': 'full', 'prefix': 'image'},
 }
 
 

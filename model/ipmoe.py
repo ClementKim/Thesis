@@ -37,10 +37,22 @@ class IPMoE(nn.Module):
         self.interaction_head = nn.Linear(embed_dim, llm_width)
         self.expert_head = nn.Linear(embed_dim, llm_width)
 
+        # Unused modules get no gradients; DDP would otherwise fail on unused parameters.
+        if self.ablation.get('prefix', 'full') == 'image':
+            for module in (self.text_encoder, self.interaction, self.interaction_adapter, self.moe, self.interaction_head, self.expert_head):
+                module.requires_grad_(False)
+            self.aux.requires_grad_(False)
+
     def encode_prefix(self, text_inputs, image_inputs):
-        # Process the image and question.
-        text_features, text_mask = self.text_encoder(**text_inputs)
         image_features = self.vision_encoder(**image_inputs)
+        image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
+
+        # The image-only baseline has no router, so it returns zero-width weights.
+        if self.ablation.get('prefix', 'full') == 'image':
+            return self.image_head(image_features), image_mask, image_features.new_empty((image_features.size(0), 0))
+
+        # Process the question.
+        text_features, text_mask = self.text_encoder(**text_inputs)
 
         # Interaction between text and vision features.
         similarity = self.interaction(text_features, image_features)
@@ -52,8 +64,6 @@ class IPMoE(nn.Module):
         expert_outputs, expert_mask, weights = self.moe(expert_map, self.aux, map_mask, router_x = router_map)
 
         # Pass image, interaction, and each weighted expert output to the LLM.
-        image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
-
         prefix = torch.cat([self.image_head(image_features), self.interaction_head(interaction_tokens), self.expert_head(expert_outputs)], dim = 1)
         prefix_mask = torch.cat([image_mask, token_mask, expert_mask], dim = 1)
 
@@ -92,6 +102,9 @@ class IPMoE(nn.Module):
         
             text_tokens = max(content.numel(), 1)  # Empty chunk retains its EOS.
             interaction_tokens = ((text_tokens + p - 1) // p) * ((image_tokens + p - 1) // p)
+            if self.ablation.get('prefix', 'full') == 'image':
+                interaction_tokens = 0
+
             lengths.append(image_tokens + 4 * interaction_tokens)
         
         return lengths
