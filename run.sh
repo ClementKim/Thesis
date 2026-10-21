@@ -4,6 +4,8 @@
 
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export FLASH_ATTENTION_DETERMINISTIC=1
+# DataLoader workers fork after the tokenizer is loaded; keep its threads in the main process only.
+export TOKENIZERS_PARALLELISM=false
 
 ALL_ABLATIONS=$(python -c 'from ablation import ABLATIONS; print(*ABLATIONS)') || exit 1
 SEEDS=${SEEDS:-"42"}

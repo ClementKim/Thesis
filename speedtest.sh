@@ -26,8 +26,8 @@ for RUN in "${RUNS[@]}"; do
     OUTPUT_DIR=$ROOT/$NAME
     mkdir -p "$OUTPUT_DIR"
 
-    # Record peak GPU memory every 2 seconds while the run is alive.
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -l 2 > "$OUTPUT_DIR/memory.csv" &
+    # Record peak GPU memory every 2 seconds, only on the GPUs this job can see.
+    nvidia-smi ${CUDA_VISIBLE_DEVICES:+-i $CUDA_VISIBLE_DEVICES} --query-gpu=memory.used --format=csv,noheader,nounits -l 2 > "$OUTPUT_DIR/memory.csv" &
     MONITOR=$!
 
     echo "=== $(date '+%F %T') $NAME"
@@ -49,8 +49,11 @@ done
 python - "$ROOT" "${RUNS[@]}" <<'EOF'
 import math, os, re, sys
 
+import torch
+
 root, runs = sys.argv[1], sys.argv[2:]
-gpus = len(os.popen('nvidia-smi -L').read().strip().splitlines())
+# Same count torchrun uses for --nproc-per-node=gpu, respecting CUDA_VISIBLE_DEVICES.
+gpus = torch.cuda.device_count()
 
 def seconds(text):
     value = 0
