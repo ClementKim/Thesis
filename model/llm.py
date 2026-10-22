@@ -1,11 +1,13 @@
 import inspect
 import re
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from peft import LoraConfig, TaskType, get_peft_model
+from peft.tuners.tuners_utils import BaseTunerLayer
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
 
 MODEL_NAMES = {
@@ -64,6 +66,9 @@ class NoValidTargetsError(ValueError):
     pass
 
 class _ImagePrefixLLM(nn.Module):
+    # Subclasses enable this when FlashAttention can read packed rows from their position IDs.
+    pack_training_rows = False
+
     def __init__(self, model_name, model_class, lora_rank, attn_implementation, gradient_checkpointing, target_modules, torch_dtype = torch.float32):
         super().__init__()
 
@@ -97,11 +102,25 @@ class _ImagePrefixLLM(nn.Module):
         self.model = get_peft_model(model, lora_config)
         self.model.print_trainable_parameters()
 
+        # LoRA weights stay fp32 for AdamW but compute in the base dtype under autocast. PEFT would otherwise
+        # copy each LoRA input to fp32; this stays off so checkpointed layers recompute the same graph.
+        self.compute_dtype = torch_dtype
+        for module in self.model.modules():
+            if isinstance(module, BaseTunerLayer):
+                module.cast_input_dtype_enabled = False
+
         self.logits_to_keep_supported = self._supports_logits_to_keep()
 
     @property
     def device(self):
         return self.model.device
+
+    def _autocast(self):
+        # Checkpointed layers replay their forward under the same autocast state during backward.
+        if self.compute_dtype == torch.float32:
+            return nullcontext()
+
+        return torch.autocast(self.device.type, dtype = self.compute_dtype)
 
     def _add_marker(self):
         self.tokenizer.add_special_tokens({'additional_special_tokens': [MM_MARKER]})
@@ -253,6 +272,17 @@ class _ImagePrefixLLM(nn.Module):
 
         return input_rows, merged_label_rows
 
+    def _pack_inputs(self, input_rows, label_rows):
+        """Concatenate training rows into one unpadded sequence."""
+        input_embeds = torch.cat(input_rows, dim = 0).unsqueeze(0)
+        labels = torch.cat(label_rows, dim = 0).unsqueeze(0)
+
+        # Positions restart at 0 for each row, which FlashAttention reads as a sequence boundary.
+        # Every row starts with prompt tokens labelled -100, so no target crosses a boundary.
+        position_ids = torch.cat([torch.arange(row.size(0), device = row.device) for row in input_rows]).unsqueeze(0)
+
+        return input_embeds, None, position_ids, labels
+
     def _pad_inputs(self, input_rows, label_rows):
         max_length = max(row.size(0) for row in input_rows)
         padded_inputs = []
@@ -305,6 +335,10 @@ class _ImagePrefixLLM(nn.Module):
 
         input_rows, merged_label_rows = self._insert_prefix(token_rows, insert_positions, prefix, label_rows, prefix_mask)
 
+        # Generation keeps left padding for batched decoding with the KV cache.
+        if merged_label_rows is not None and self.pack_training_rows:
+            return self._pack_inputs(input_rows, merged_label_rows)
+
         return self._pad_inputs(input_rows, merged_label_rows)
 
     def forward(self, input_embeds, attention_mask, position_ids, labels, optimize = True):
@@ -316,7 +350,8 @@ class _ImagePrefixLLM(nn.Module):
         }
 
         if not optimize or not self.logits_to_keep_supported:
-            output = self.model(**model_inputs, labels = labels)
+            with self._autocast():
+                output = self.model(**model_inputs, labels = labels)
 
             return output.loss
 
@@ -328,11 +363,13 @@ class _ImagePrefixLLM(nn.Module):
         active_positions = answer_mask.any(dim = 0)
         prediction_positions = active_positions.nonzero(as_tuple = True)[0]
         if prediction_positions.numel() == 0:
-            output = self.model(**model_inputs, labels = labels)
+            with self._autocast():
+                output = self.model(**model_inputs, labels = labels)
 
             return output.loss
 
-        output = self.model(**model_inputs, logits_to_keep = prediction_positions)
+        with self._autocast():
+            output = self.model(**model_inputs, logits_to_keep = prediction_positions)
         answer_labels = next_token_labels.index_select(1, prediction_positions)
 
         logits = output.logits.float()
@@ -351,8 +388,9 @@ class _ImagePrefixLLM(nn.Module):
 
         # Keep all EOS IDs from the checkpoint's generation configuration.
         # generate() updates positions from the mask as it adds tokens.
-        generated_ids = self.model.generate(inputs_embeds = input_embeds, attention_mask = attention_mask, max_new_tokens = max_new_tokens,
-                                            do_sample = False, use_cache = True, pad_token_id = self.tokenizer.pad_token_id)
+        with self._autocast():
+            generated_ids = self.model.generate(inputs_embeds = input_embeds, attention_mask = attention_mask, max_new_tokens = max_new_tokens,
+                                                do_sample = False, use_cache = True, pad_token_id = self.tokenizer.pad_token_id)
         decoded = self.tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
 
         return [prediction.strip() for prediction in decoded]
@@ -366,6 +404,9 @@ class LlamaLLM(_ImagePrefixLLM):
         target_modules = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
 
         super().__init__(model_name, AutoModelForCausalLM, lora_rank, attn_implementation, gradient_checkpointing, target_modules, torch_dtype)
+
+        # SDPA and eager would need a full block-diagonal mask over the packed sequence.
+        self.pack_training_rows = attn_implementation == 'flash_attention_2'
 
 class Qwen25VLLLM(_ImagePrefixLLM):
     def __init__(self, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):

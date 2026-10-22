@@ -88,14 +88,10 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.k(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        scores = q @ k.transpose(2, 3) * self.scale
-
-        if mask is not None:
-            scores = scores.masked_fill(~mask[:, None, None, :], -torch.inf)
-
-        A = F.softmax(scores, dim = -1)
-
-        SA = (A @ v).transpose(1, 2).reshape(B, N, D)
+        # The fused kernel computes softmax(q k^T * scale) v without storing the N x N attention matrix.
+        key_mask = mask[:, None, None, :] if mask is not None else None
+        SA = F.scaled_dot_product_attention(q, k, v, attn_mask = key_mask, scale = self.scale)
+        SA = SA.transpose(1, 2).reshape(B, N, D)
 
         out = self.dropout(self.o(SA))
 

@@ -5,7 +5,7 @@ if __package__:
 else:
     from common import PatchEmbeddingLayer, SelfAttentionBlock, CrossAttentionBlock
 
-DEPTH = 12
+DEPTH = 8
 
 class SelfExpert(nn.Module):
     def __init__(self, patch_size, in_c, embed_dim, num_heads, mlp_ratio, drop, attn_drop, is_cls_token):

@@ -323,13 +323,13 @@ def parse_args():
 
     parser.add_argument('--gradient-checkpointing', action = argparse.BooleanOptionalAction, default = True)
     parser.add_argument('--context-limit', type = int, default = 4096)
-    parser.add_argument('--batch-size', type = int, default = 1, help = 'Examples per GPU (global batch size = batch size * world size)')
+    parser.add_argument('--batch-size', type = int, default = 1)
     parser.add_argument('--epochs', type = int, default = 1)
     parser.add_argument('--learning-rate', type = float, default = 1e-4)
     parser.add_argument('--warmup-ratio', type = float, default = 0.03)
     parser.add_argument('--max-grad-norm', type = float, default = 1.0)
     parser.add_argument('--max-train-samples', type = int, default = None)
-    parser.add_argument('--num-workers', type = int, default = 4, help = 'DataLoader worker processes per GPU')
+    parser.add_argument('--num-workers', type = int, default = 4)
     parser.add_argument('--output-dir', default = None)
     args = parser.parse_args()
 
