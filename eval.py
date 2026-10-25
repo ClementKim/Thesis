@@ -168,6 +168,7 @@ def main():
     from main import reproduce
     from vlmeval.api import OpenAIWrapper
     from vlmeval_adapter import IPMoEVLMEval
+    from vlmeval_baselines import BASELINES
 
     seed = int(os.environ['PYTHONHASHSEED'])
     reproduce(seed)
@@ -176,6 +177,7 @@ def main():
     context_limit = os.environ.get('IPMOE_CONTEXT_LIMIT')
     context_limit = int(context_limit) if context_limit is not None else None
     run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path, context_limit = context_limit)
+    run.supported_VLM.update(BASELINES)
 
     use_completion_tokens(OpenAIWrapper)
     # OpenAIWrapper logs the judge's API key at INFO, which would reach the console and run logs.
