@@ -4,6 +4,8 @@
 # JUDGE extracts answers that rule-based matching cannot parse; gpt-6-luna reads OPENAI_API_KEY from VLMEvalKit/.env.
 # JUDGE=exact_matching scores every benchmark without an LLM.
 # Extra arguments go to eval.py, e.g. ./eval.sh --judge-api-nproc 8
+# Inference uses the decoder's context capacity, independent of the training cap.
+# Set IPMOE_CONTEXT_LIMIT=16384 to impose a smaller total token budget if needed.
 #
 # Choose GPUs with CUDA_VISIBLE_DEVICES:
 # CUDA_VISIBLE_DEVICES=0 ./eval.sh     # GPU 0 only
@@ -20,6 +22,7 @@ ALL_ABLATIONS=$(python -c 'from ablation import ABLATIONS; print(*ABLATIONS)') |
 SEEDS=${SEEDS:-"42"}
 ABLATIONS=${ABLATIONS:-$ALL_ABLATIONS}
 DATASETS=${DATASETS:-"NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
+# DATASETS=${DATASETS:-"MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
 JUDGE=${JUDGE:-gpt-6-luna}
 
 # Reject typos now rather than after hours of other evaluations.

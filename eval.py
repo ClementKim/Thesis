@@ -173,7 +173,9 @@ def main():
     reproduce(seed)
     checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/seed_{seed}/checkpoint.pt')
     checkpoint_path = os.path.abspath(checkpoint_path)
-    run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path)
+    context_limit = os.environ.get('IPMOE_CONTEXT_LIMIT')
+    context_limit = int(context_limit) if context_limit is not None else None
+    run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path, context_limit = context_limit)
 
     use_completion_tokens(OpenAIWrapper)
     # OpenAIWrapper logs the judge's API key at INFO, which would reach the console and run logs.
