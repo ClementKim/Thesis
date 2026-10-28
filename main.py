@@ -74,7 +74,8 @@ def build_model(device, args):
     hybrid_expert = HybridExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
 
     ## Router
-    moe = MoE(1, self_expert, cross_expert, hybrid_expert, router_mode = ablation['router_mode'])
+    moe = MoE(1, self_expert, cross_expert, hybrid_expert, router_mode = ablation['router_mode'],
+              expert_set = ablation.get('expert_set', 'all'))
 
     ## LLM
     dtype = torch.bfloat16 if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
