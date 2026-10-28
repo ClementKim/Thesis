@@ -1,0 +1,15 @@
+# Install the appropriate CUDA-enabled PyTorch/torchvision builds first.
+torch>=2.5,<3
+torchvision
+numpy>=1.26,<3
+transformers==4.57.1
+peft==0.17.1
+accelerate==1.10.1
+huggingface-hub>=0.34,<1
+pillow>=10
+pyarrow>=16
+tqdm>=4.66
+flash-attn==2.8.3
+
+# Run from the repository root to install VLMEvalKit and its dependencies.
+-e ./VLMEvalKit

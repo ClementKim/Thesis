@@ -29,6 +29,13 @@ def _option_text(value):
 
     return str(value)
 
+def mcq_prompt(line):
+    """Same layout as training: hint, question, "A. option" lines, then the instruction."""
+    hint = line['hint'] if 'hint' in line and not pd.isna(line['hint']) else None
+    options = [f'{key}. {_option_text(line[key])}' for key in string.ascii_uppercase if key in line and not pd.isna(line[key])]
+
+    return '\n'.join([*([hint] if hint else []), line['question'], *options, MCQ_INSTRUCTION])
+
 class IPMoEVLMEval(BaseModel):
     INTERLEAVE = False
     VIDEO_LLM = False
@@ -108,11 +115,8 @@ class IPMoEVLMEval(BaseModel):
         if not isinstance(image_paths, list):
             image_paths = [image_paths]
 
-        # Same layout as training: hint, question, "A. option" lines, then the instruction.
         if dataset in MCQ_DATASETS:
-            hint = line['hint'] if 'hint' in line and not pd.isna(line['hint']) else None
-            options = [f'{key}. {_option_text(line[key])}' for key in string.ascii_uppercase if key in line and not pd.isna(line[key])]
-            prompt = '\n'.join([*([hint] if hint else []), line['question'], *options, MCQ_INSTRUCTION])
+            prompt = mcq_prompt(line)
 
         else:
             prompt = f"{line['question']}\n{SHORT_ANSWER_INSTRUCTION}"

@@ -8,9 +8,10 @@ export FLASH_ATTENTION_DETERMINISTIC=1
 export TOKENIZERS_PARALLELISM=false
 
 ALL_ABLATIONS=$(python -c 'from ablation import ABLATIONS; print(*ABLATIONS)') || exit 1
-# SEEDS=${SEEDS:-"42 43 44"}
-SEEDS=${SEEDS:-"43 44"}
+SEEDS=${SEEDS:-"42 43 44"}
 ABLATIONS=${ABLATIONS:-$ALL_ABLATIONS}
+LLM_TYPE=${LLM_TYPE:-llama}
+# LLM_TYPE=${LLM_TYPE:-qwen}
 
 # Reject typos now rather than after days of other runs.
 for ABLATION in $ABLATIONS; do
@@ -36,7 +37,7 @@ for SEED in $SEEDS; do
             --seed $SEED \
             --ablation $ABLATION \
             --attn-implementation flash_attention_2 \
-            --llm-type qwen \
+            --llm-type "$LLM_TYPE" \
             --output-dir $OUTPUT_DIR \
             --batch-size 6 2>&1 | tee "$OUTPUT_DIR/train.log"
 

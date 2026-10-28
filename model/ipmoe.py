@@ -25,6 +25,8 @@ class IPMoE(nn.Module):
             raise ValueError('Unsupported ablation configuration')
         if self.moe.router_mode != self.ablation['router_mode']:
             raise ValueError('Router mode differs from the ablation configuration')
+        if self.moe.expert_set != self.ablation.get('expert_set', 'all'):
+            raise ValueError('Expert set differs from the ablation configuration')
 
         ## Auxiliary Tokens
         self.aux = nn.Parameter(torch.randn(1, num_aux_tokens, embed_dim))
@@ -43,6 +45,9 @@ class IPMoE(nn.Module):
                 module.requires_grad_(False)
             self.aux.requires_grad_(False)
 
+        if self.ablation.get('expert_set', 'all') == 'self':
+            self.aux.requires_grad_(False)
+
     def encode_prefix(self, text_inputs, image_inputs):
         image_features = self.vision_encoder(**image_inputs)
         image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
@@ -56,9 +61,10 @@ class IPMoE(nn.Module):
 
         # Interaction between text and vision features.
         similarity = self.interaction(text_features, image_features)
+        similarity = select_interaction_map(similarity, self.ablation.get('shared_map', 'full'))
         interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
 
-        # Keep the direct interaction prefix intact and select the other paths independently.
+        # Select the expert and router inputs from the shared map independently.
         expert_map = select_interaction_map(interaction_map, self.ablation['expert_map'])
         router_map = select_interaction_map(interaction_map, self.ablation['router_map'])
         expert_outputs, expert_mask, weights = self.moe(expert_map, self.aux, map_mask, router_x = router_map)
@@ -91,6 +97,7 @@ class IPMoE(nn.Module):
         if cfg.bos_token_id is None or cfg.eos_token_id is None:
             raise ValueError('CLIP text configuration must define BOS and EOS token IDs')
         
+        num_experts = 3 if self.ablation.get('expert_set', 'all') == 'all' else 1
         lengths = []
         for ids, mask in zip(text_inputs['input_ids'], text_inputs['attention_mask']):
             content = ids[mask.bool()]
@@ -105,7 +112,7 @@ class IPMoE(nn.Module):
             if self.ablation.get('prefix', 'full') == 'image':
                 interaction_tokens = 0
 
-            lengths.append(image_tokens + 4 * interaction_tokens)
+            lengths.append(image_tokens + (1 + num_experts) * interaction_tokens)
         
         return lengths
 

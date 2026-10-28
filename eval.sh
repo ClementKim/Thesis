@@ -22,7 +22,6 @@ ALL_ABLATIONS=$(python -c 'from ablation import ABLATIONS; print(*ABLATIONS)') |
 SEEDS=${SEEDS:-"42"}
 ABLATIONS=${ABLATIONS:-$ALL_ABLATIONS}
 DATASETS=${DATASETS:-"NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
-# DATASETS=${DATASETS:-"MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
 JUDGE=${JUDGE:-gpt-6-luna}
 
 # Reject typos now rather than after hours of other evaluations.
