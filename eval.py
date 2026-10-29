@@ -165,19 +165,30 @@ def main():
     # Let VLMEvalKit assign GPUs before importing Torch or the model.
     from VLMEvalKit import run
     import torch.distributed as distributed
-    from main import reproduce
     from vlmeval.api import OpenAIWrapper
-    from vlmeval_adapter import IPMoEVLMEval
-    from vlmeval_baselines import BASELINES
 
     seed = int(os.environ['PYTHONHASHSEED'])
-    reproduce(seed)
-    checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/seed_{seed}/checkpoint.pt')
-    checkpoint_path = os.path.abspath(checkpoint_path)
-    context_limit = os.environ.get('IPMOE_CONTEXT_LIMIT')
-    context_limit = int(context_limit) if context_limit is not None else None
-    run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path, context_limit = context_limit)
-    run.supported_VLM.update(BASELINES)
+    if os.environ.get('IPMOE_TOOLKIT_ONLY') == '1':
+        # Environments for VLMEvalKit's own models (e.g. DeepSeek-VL2's older Transformers) cannot import IP-MoE,
+        # so only the toolkit's registry is available and seeding is done here.
+        import random
+        import numpy as np
+        import torch
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+    else:
+        from main import reproduce
+        from vlmeval_adapter import IPMoEVLMEval
+        from vlmeval_baselines import BASELINES
+
+        reproduce(seed)
+        checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/seed_{seed}/checkpoint.pt')
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        context_limit = os.environ.get('IPMOE_CONTEXT_LIMIT')
+        context_limit = int(context_limit) if context_limit is not None else None
+        run.supported_VLM['IPMoE'] = partial(IPMoEVLMEval, checkpoint_path = checkpoint_path, context_limit = context_limit)
+        run.supported_VLM.update(BASELINES)
 
     use_completion_tokens(OpenAIWrapper)
     # OpenAIWrapper logs the judge's API key at INFO, which would reach the console and run logs.

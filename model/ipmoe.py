@@ -48,7 +48,8 @@ class IPMoE(nn.Module):
         if self.ablation.get('expert_set', 'all') == 'self':
             self.aux.requires_grad_(False)
 
-    def encode_prefix(self, text_inputs, image_inputs):
+    def encode_prefix(self, text_inputs, image_inputs, map_image_inputs = None):
+        """map_image_inputs, if given, builds the interaction map from another image while the image tokens keep the true one."""
         image_features = self.vision_encoder(**image_inputs)
         image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
 
@@ -60,7 +61,8 @@ class IPMoE(nn.Module):
         text_features, text_mask = self.text_encoder(**text_inputs)
 
         # Interaction between text and vision features.
-        similarity = self.interaction(text_features, image_features)
+        map_features = image_features if map_image_inputs is None else self.vision_encoder(**map_image_inputs)
+        similarity = self.interaction(text_features, map_features)
         similarity = select_interaction_map(similarity, self.ablation.get('shared_map', 'full'))
         interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
 
@@ -151,11 +153,12 @@ class IPMoE(nn.Module):
         return loss, weights
 
     @torch.no_grad()
-    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True):
+    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True,
+                 map_image_inputs = None):
         if self.training:
             raise RuntimeError('Call model.eval() before generation')
         
-        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
+        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs, map_image_inputs)
         text_budget = [context_limit - length - max_new_tokens for length in prefix_mask.sum(dim = 1).tolist()]
 
         token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget, enforce_mcq_format = enforce_mcq_format)

@@ -46,25 +46,36 @@ VERSION = 2
 PATTERN = re.compile(r'\bthe ([A-Za-z][A-Za-z -]*?) \(highlighted by an? (\w+) box\)')
 CHANNELS = {'red': 0, 'green': 1, 'blue': 2}
 
+def similarity_of(text, patches, similarity):
+    """'cosine' L2-normalizes every token and patch first; 'dot' keeps the raw features."""
+    if similarity == 'cosine':
+        text, patches = F.normalize(text, dim = -1), F.normalize(patches, dim = -1)
+
+    return torch.bmm(text, patches.transpose(1, 2))
+
 class TrainedMap(nn.Module):
     """The checkpoint's text and vision MLPs on frozen CLIP, combined as in IPMoE.encode_prefix."""
 
-    def __init__(self, text_encoder, vision_encoder, interaction):
+    def __init__(self, text_encoder, vision_encoder, interaction, similarity = 'map'):
         super().__init__()
 
         self.text_encoder = text_encoder
         self.vision_encoder = vision_encoder
         self.interaction = interaction
+        self.similarity = similarity
 
     def forward(self, text_inputs, image_inputs):
         text_features, _ = self.text_encoder(**text_inputs)
+        patches = self.vision_encoder(**image_inputs)
+        if self.similarity == 'map':
+            return self.interaction(text_features, patches)
 
-        return self.interaction(text_features, self.vision_encoder(**image_inputs))
+        return similarity_of(text_features, patches, self.similarity)
 
 class CLIPMap(nn.Module):
     """Frozen CLIP cosine similarity between the same text tokens and penultimate patches, without trained MLPs."""
 
-    def __init__(self, text_encoder):
+    def __init__(self, text_encoder, similarity = 'map'):
         super().__init__()
 
         # Reuse the text encoder's chunking with CLIP's own projection only.
@@ -72,18 +83,20 @@ class CLIPMap(nn.Module):
         text_encoder.add_chunk_position = False
         self.text_encoder = text_encoder
         self.clip = text_encoder.clip
+        self.similarity = 'cosine' if similarity == 'map' else similarity
 
     def forward(self, text_inputs, image_inputs):
         text_features, _ = self.text_encoder(**text_inputs)
         hidden = self.clip.vision_model(pixel_values = image_inputs['pixel_values'], output_hidden_states = True).hidden_states[-2][:, 1:]
         patches = self.clip.visual_projection(self.clip.vision_model.post_layernorm(hidden))
 
-        return torch.bmm(F.normalize(text_features, dim = -1), F.normalize(patches, dim = -1).transpose(1, 2))
+        return similarity_of(text_features, patches, self.similarity)
 
-def load_map(checkpoint_path, device):
+def load_map(checkpoint_path, device, similarity = 'map'):
+    # similarity 'map' keeps each map's own definition; the other choices test what normalization alone explains.
     if checkpoint_path is None:
         processor, text_encoder, _ = encoding(0.0, device)
-        return processor, CLIPMap(text_encoder).to(device).eval(), {'map': 'clip'}
+        return processor, CLIPMap(text_encoder, similarity).to(device).eval(), {'map': 'clip', 'similarity': similarity}
 
     checkpoint = torch.load(checkpoint_path, map_location = 'cpu', weights_only = True)
     args = Namespace(**checkpoint['args'])
@@ -108,9 +121,10 @@ def load_map(checkpoint_path, device):
                     raise ValueError(f'Checkpoint shape mismatch for {prefix}{name}: {tuple(found[name].shape)} != {tuple(parameter.shape)}')
                 parameter.copy_(found[name])
 
-    model = TrainedMap(text_encoder, vision_encoder, Interaction(args.interaction_type)).to(device).eval()
-    meta = {'map': 'trained', 'checkpoint': checkpoint_path, 'ablation': getattr(args, 'ablation', 'full'),
-            'llm_type': args.llm_type, 'seed': args.seed}
+    model = TrainedMap(text_encoder, vision_encoder, Interaction(args.interaction_type), similarity).to(device).eval()
+    # rebuttal.py init saves the MLPs a seed starts training from, which must not pool with trained maps.
+    meta = {'map': 'initial' if checkpoint.get('initial') else 'trained', 'checkpoint': checkpoint_path, 'ablation': getattr(args, 'ablation', 'full'),
+            'llm_type': args.llm_type, 'seed': args.seed, 'similarity': similarity}
 
     return processor, model, meta
 
@@ -185,7 +199,7 @@ def shortcut(category, boxes, answer):
     return guess == answer
 
 @torch.no_grad()
-def measure(line, processor, model, device, image_root):
+def measure(line, processor, model, device, image_root, center = False):
     """Score one question, or return the reason it was skipped."""
     prompt = mcq_prompt(line)
     offset = prompt.index(line['question'])
@@ -212,6 +226,9 @@ def measure(line, processor, model, device, image_root):
     text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
     image_inputs = {key: value.to(device) for key, value in image_inputs.items()}
     similarity = model(text_inputs, image_inputs)[0].float().cpu().numpy()
+    if center:
+        # Remove each patch's mean over the tokens, i.e. whatever every word's map shares, such as image saliency.
+        similarity = similarity - similarity.mean(axis = 0, keepdims = True)
 
     if similarity.shape[0] != max(int(text_inputs['attention_mask'].sum()) - 2, 1):
         raise RuntimeError('Interaction map rows do not match the CLIP content tokens')
@@ -273,6 +290,8 @@ def logistic(y, X):
 
 def summarize(records, meta, skipped):
     # The map's sign is arbitrary (frozen CLIP's comes out inverted), so fix it on Distance, then test on Depth.
+    # Superseded for reporting: this rule flips seed 42 on a median of -3.7e-17; rebuttal.py h1 recomputes every
+    # statistic from items.csv with |median| < 1e-9 as a tie of sign +1, and keeps this rule as its sensitivity check.
     calibration = [r['d'] for r in records if r['category'] == 'Distance' and not r['overlap']]
     sign = -1 if calibration and np.median(calibration) < 0 else 1
     suffix = '' if sign > 0 else '_neg'
@@ -350,6 +369,12 @@ def load_runs(directories):
 
 def check_compatible(summaries):
     """Runs that are pooled or compared must cover the same questions and, if trained, use the same language model."""
+    # Runs measured before --center or --similarity existed are uncentred and use each map's own similarity.
+    centers = {summary.get('center', False) for summary in summaries}
+    if len(centers) > 1:
+        raise ValueError('Runs differ in center: centred and uncentred maps cannot be pooled or compared')
+    if len({summary.get('similarity', 'map') for summary in summaries}) > 1:
+        raise ValueError('Runs differ in similarity and cannot be pooled or compared')
     for key in ('limit', 'llm_type'):
         values = {summary[key] for summary in summaries if key in summary}
         if len(values) > 1:
@@ -369,7 +394,8 @@ def pool(runs, directories):
 
     summary = {
         'version': VERSION, 'pooled': directories, 'map': summaries[0]['map'], 'ablation': ablation,
-        'llm_type': summaries[0].get('llm_type'), 'limit': summaries[0]['limit'],
+        'llm_type': summaries[0].get('llm_type'), 'limit': summaries[0]['limit'], 'center': summaries[0].get('center', False),
+        'similarity': summaries[0].get('similarity', 'map'),
         'seeds': [summary.get('seed') for summary in summaries], 'signs': [summary['sign'] for summary in summaries],
         'Depth': {
             'test': 'primary' if ablation == 'full' else 'secondary',
@@ -415,9 +441,12 @@ def main():
                         help = 'Output directories of another arm, paired by seed, or of the CLIP reference; repeat for each arm')
     parser.add_argument('--output-dir', required = True)
     parser.add_argument('--limit', type = int, default = None, help = 'Questions per category, for a quick check')
+    parser.add_argument('--center', action = 'store_true', help = "Subtract each patch's mean over the tokens before scoring")
+    parser.add_argument('--similarity', choices = ['map', 'cosine', 'dot'], default = 'map',
+                        help = "map: the map's own (trained: raw dot product, CLIP: cosine); cosine or dot for either map")
     args = parser.parse_args()
-    if args.pool and (args.predictions or args.limit is not None):
-        parser.error('--predictions and --limit apply when measuring, not with --pool')
+    if args.pool and (args.predictions or args.limit is not None or args.center or args.similarity != 'map'):
+        parser.error('--predictions, --limit, --center and --similarity apply when measuring, not with --pool')
 
     # Read everything to compare with first, so a mismatch fails before the measurement.
     others = [load_runs(directories) for directories in args.compare_with]
@@ -433,8 +462,8 @@ def main():
 
     else:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        processor, model, meta = load_map(args.checkpoint, device)
-        meta.update(version = VERSION, limit = args.limit)
+        processor, model, meta = load_map(args.checkpoint, device, args.similarity)
+        meta.update(version = VERSION, limit = args.limit, center = args.center)
         check_compatible([meta] + compared)
 
         data = pd.read_csv(args.data, sep = '\t')
@@ -451,7 +480,7 @@ def main():
 
         records, skipped = [], {}
         for _, line in tqdm(data.iterrows(), total = len(data), desc = 'H1'):
-            record = measure(line, processor, model, device, args.image_root)
+            record = measure(line, processor, model, device, args.image_root, center = args.center)
             if isinstance(record, str):
                 skipped[record] = skipped.get(record, 0) + 1
                 continue

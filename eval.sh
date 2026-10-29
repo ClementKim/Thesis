@@ -4,6 +4,9 @@
 # JUDGE extracts answers that rule-based matching cannot parse; gpt-6-luna reads OPENAI_API_KEY from VLMEvalKit/.env.
 # JUDGE=exact_matching scores every benchmark without an LLM.
 # Extra arguments go to eval.py, e.g. ./eval.sh --judge-api-nproc 8
+# FULL_DIR holds the full-model seeds (checkpoint by default, where run.sh writes them; checkpoint/llama once moved)
+# and OUT the results, e.g. FULL_DIR=checkpoint/llama OUT=evaluation/llama ABLATIONS=full ./eval.sh
+# IPMOE_INTERVENTION applies a test-time intervention (see vlmeval_adapter.py); give it its own OUT.
 # Inference uses the decoder's context capacity, independent of the training cap.
 # Set IPMOE_CONTEXT_LIMIT=16384 to impose a smaller total token budget if needed.
 #
@@ -23,6 +26,8 @@ SEEDS=${SEEDS:-"42"}
 ABLATIONS=${ABLATIONS:-$ALL_ABLATIONS}
 DATASETS=${DATASETS:-"NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
 JUDGE=${JUDGE:-gpt-6-luna}
+FULL_DIR=${FULL_DIR:-checkpoint}
+OUT=${OUT:-evaluation}
 
 # Reject typos now rather than after hours of other evaluations.
 for ABLATION in $ABLATIONS; do
@@ -70,14 +75,14 @@ fi
 FAILED=()
 for SEED in $SEEDS; do
     for ABLATION in $ABLATIONS; do
-        # Load the checkpoint run.sh wrote and mirror its layout under evaluation/.
+        # Load the checkpoint run.sh wrote and mirror its layout under OUT.
         if [ "$ABLATION" = full ]; then
-            SUBDIR=seed_$SEED
+            CHECKPOINT=$FULL_DIR/seed_$SEED/checkpoint.pt
+            WORK_DIR=$OUT/seed_$SEED
         else
-            SUBDIR=ablations/$ABLATION/seed_$SEED
+            CHECKPOINT=checkpoint/ablations/$ABLATION/seed_$SEED/checkpoint.pt
+            WORK_DIR=$OUT/ablations/$ABLATION/seed_$SEED
         fi
-        CHECKPOINT=checkpoint/$SUBDIR/checkpoint.pt
-        WORK_DIR=evaluation/$SUBDIR
 
         # Arms still training, or whose training failed, have no checkpoint yet.
         if [ ! -f "$CHECKPOINT" ]; then
@@ -90,7 +95,7 @@ for SEED in $SEEDS; do
 
         for PROTOCOL in "${PROTOCOLS[@]}"; do
             read -r RUN_JUDGE RUN_DATASETS <<< "$PROTOCOL"
-            echo "=== $(date '+%F %T') ablation=$ABLATION seed=$SEED judge=$RUN_JUDGE data=[$RUN_DATASETS] checkpoint=$CHECKPOINT" \
+            echo "=== $(date '+%F %T') ablation=$ABLATION seed=$SEED judge=$RUN_JUDGE data=[$RUN_DATASETS] checkpoint=$CHECKPOINT intervention=${IPMOE_INTERVENTION:-none}" \
                 | tee -a "$WORK_DIR/eval.log"
             PYTHONHASHSEED="$SEED" IPMOE_CHECKPOINT="$CHECKPOINT" torchrun --standalone --nproc-per-node=gpu eval.py \
                 --model IPMoE \

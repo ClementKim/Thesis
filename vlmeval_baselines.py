@@ -124,6 +124,8 @@ class LLaVAHF(BaseModel):
         # "A", followed by the MCQ instruction.
         prompt = re.sub(r'(?m)^([A-F]) ', r'(\1) ', line['prompt']) + '\n' + MCQ_INSTRUCTION
         image_paths = self.dump_image(line, dataset)
+        if not isinstance(image_paths, list):
+            image_paths = [image_paths]
         return [dict(type = 'image', value = path) for path in image_paths] + [dict(type = 'text', value = prompt)]
 
     def generate_inner(self, message, dataset = None):
@@ -168,4 +170,8 @@ BASELINES = {
     # CV-Bench 2D 62.2 / 3D 65.3 for it.
     'LLaVA-NeXT-8B': partial(LLaVAHF, model_path = 'llava-hf/llama3-llava-next-8b-hf',
                              model_class = LlavaNextForConditionalGeneration, template = LLAVA_LLAMA_3_TEMPLATE),
+    # The same model prompted as in Cambrian-1's CV-Bench scripts, to test whether the prompt explains the gap to 65.3.
+    'LLaVA-NeXT-8B-Cambrian': partial(LLaVAHF, model_path = 'llava-hf/llama3-llava-next-8b-hf',
+                                      model_class = LlavaNextForConditionalGeneration, template = LLAVA_LLAMA_3_TEMPLATE,
+                                      cambrian_prompt = True),
 }
