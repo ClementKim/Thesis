@@ -63,7 +63,7 @@ class IPMoEVLMEval(BaseModel):
         self.max_new_tokens = max_new_tokens
 
         ## Model Building
-        processor, text_encoder, vision_encoder, interaction, llm = build_model(self.device, args)
+        processor, text_encoder, vision_encoder, llm = build_model(self.device, args)
         # The checkpoint's context_limit is a training memory budget. Inference
         # keeps the complete prefix and question up to the decoder's capacity.
         config = llm.model.config
@@ -76,8 +76,8 @@ class IPMoEVLMEval(BaseModel):
         logging.getLogger(f'vlmeval.{__name__}').info('Context tokens: inference=%s, training=%s, decoder=%s, max_new_tokens=%s',
                                                     self.context_limit, args.context_limit, model_context_limit, max_new_tokens)
         self.processor = processor
-        model_options = {field: value for field, value in model_config.items() if field not in ('architecture', 'interaction_type')}
-        self.model = IPMoE(processor, text_encoder, vision_encoder, interaction, llm, **model_options).to(self.device)
+        model_options = {field: value for field, value in model_config.items() if field not in ('architecture', 'interaction_type', 'drop')}
+        self.model = IPMoE(text_encoder, vision_encoder, llm, **model_options).to(self.device)
 
         ## Load Trained Parameters
         parameters = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
@@ -139,7 +139,7 @@ class IPMoEVLMEval(BaseModel):
         image_inputs = {key: value.to(self.device) for key, value in image_inputs.items()}
 
         ## Generate Answer
-        answers, _ = self.model.generate([question], text_inputs, image_inputs, self.context_limit,
-                                         max_new_tokens = self.max_new_tokens, enforce_mcq_format = False)
+        answers = self.model.generate([question], text_inputs, image_inputs, self.context_limit,
+                                      max_new_tokens = self.max_new_tokens)
 
         return answers[0]

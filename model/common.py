@@ -5,24 +5,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PatchEmbeddingLayer(nn.Module):
-    def __init__(self, in_channels, embed_dim, patch_size, is_cls_token = True):
+    def __init__(self, in_channels, embed_dim, patch_size):
         super().__init__()
 
         self.embed_dim = embed_dim
-        self.is_cls_token = is_cls_token
         self.patch_size = patch_size
 
         self.patchify = nn.Conv2d(in_channels, embed_dim, kernel_size = patch_size, stride = patch_size)
         self.linear = nn.Linear(embed_dim, embed_dim)
-        if self.is_cls_token:
-            self.cls_token = nn.Parameter(torch.randn((1, 1, embed_dim)))
 
-    def forward(self, x, mask = None, row_indices = None, column_indices = None):
-        B, C, H, W = x.shape
+    def forward(self, x, mask = None, column_indices = None):
+        B, _, H, W = x.shape
 
-        for indices, length in ((row_indices, H), (column_indices, W)):
-            if indices is not None and tuple(indices.shape) != (B, length):
-                raise ValueError('Selected indices must match the map batch and axis dimensions')
+        if column_indices is not None and tuple(column_indices.shape) != (B, W):
+            raise ValueError('Selected image indices must match the map batch and columns')
 
         if mask is None:
             mask = torch.ones((B, H, W), dtype = torch.bool, device = x.device)
@@ -44,7 +40,7 @@ class PatchEmbeddingLayer(nn.Module):
 
         # Retain original map-block coordinates after selection; ignore padded indices.
         positions = []
-        for length, D, indices in ((H, self.embed_dim // 2, row_indices), (W, self.embed_dim - self.embed_dim // 2, column_indices)):
+        for length, D, indices in ((H, self.embed_dim // 2, None), (W, self.embed_dim - self.embed_dim // 2, column_indices)):
             if indices is None:
                 coordinates = torch.arange(length, device = x.device, dtype = torch.float32)[None].expand(B, -1)
             else:
@@ -66,145 +62,4 @@ class PatchEmbeddingLayer(nn.Module):
         x = x + positional_embedding.reshape(B, H * W, self.embed_dim).to(x.dtype)
         x = x.masked_fill(~mask[:, :, None], 0)
 
-        if self.is_cls_token:
-            cls = self.cls_token.expand(B, 1, self.embed_dim)
-            x = torch.cat((cls, x), dim = 1)
-            mask = torch.cat((torch.ones((B, 1), dtype = torch.bool, device = x.device), mask), dim = 1)
-
         return x, mask
-
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, embed_dim = 192, num_heads = 12, drop = 0.0):
-        super(MultiHeadSelfAttention, self).__init__()
-
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.q = nn.Linear(embed_dim, embed_dim)
-        self.k = nn.Linear(embed_dim, embed_dim)
-        self.v = nn.Linear(embed_dim, embed_dim)
-
-        self.o = nn.Linear(embed_dim, embed_dim)
-
-        self.dropout = nn.Dropout(drop)
-
-    def forward(self, x, mask = None):
-        B, N, D = x.shape
-
-        if mask is not None:
-            mask = mask.to(device = x.device, dtype = torch.bool)
-            x = x.masked_fill(~mask[:, :, None], 0)
-
-        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # The fused kernel computes softmax(q k^T * scale) v without storing the N x N attention matrix.
-        key_mask = mask[:, None, None, :] if mask is not None else None
-        SA = F.scaled_dot_product_attention(q, k, v, attn_mask = key_mask, scale = self.scale)
-        SA = SA.transpose(1, 2).reshape(B, N, D)
-
-        out = self.dropout(self.o(SA))
-
-        if mask is not None:
-            out = out.masked_fill(~mask[:, :, None], 0)
-
-        return out
-
-class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, embed_dim = 192, num_heads = 12, drop = 0.0):
-        super(MultiHeadCrossAttention, self).__init__()
-
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.q = nn.Linear(embed_dim, embed_dim)
-        self.k = nn.Linear(embed_dim, embed_dim)
-        self.v = nn.Linear(embed_dim, embed_dim)
-
-        self.o = nn.Linear(embed_dim, embed_dim)
-
-        self.dropout = nn.Dropout(drop)
-
-    def forward(self, x, context, mask = None):
-        B, N, D = x.shape
-        M = context.size(1)
-
-        if mask is not None:
-            mask = mask.to(device = context.device, dtype = torch.bool)
-            context = context.masked_fill(~mask[:, :, None], 0)
-
-        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k(context).reshape(B, M, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v(context).reshape(B, M, self.num_heads, self.head_dim).transpose(1, 2)
-
-        scores = q @ k.transpose(2, 3) * self.scale
-
-        if mask is not None:
-            scores = scores.masked_fill(~mask[:, None, None, :], -torch.inf)
-
-        A = F.softmax(scores, dim = -1)
-
-        CA = (A @ v).transpose(1, 2).reshape(B, N, D)
-
-        out = self.dropout(self.o(CA))
-
-        return out
-
-class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features, drop = 0.0):
-        super().__init__()
-
-        out_features = in_features
-
-        self.linear1 = nn.Linear(in_features, hidden_features)
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(drop)
-        self.linear2 = nn.Linear(hidden_features, out_features)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.linear2(x)
-
-        return self.dropout(x)
-
-class SelfAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio = 2.0, drop = 0.0, attn_drop = 0.0):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim, num_heads, attn_drop)
-        self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
-
-    def forward(self, x, mask = None):
-        x = x + self.attn(self.norm1(x), mask)
-        x = x + self.mlp(self.norm2(x))
-        
-        if mask is not None:
-            x = x.masked_fill(~mask.to(device = x.device, dtype = torch.bool)[:, :, None], 0)
-
-        return x
-
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio = 2.0, drop = 0.0, attn_drop = 0.0):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.attn = MultiHeadCrossAttention(dim, num_heads, attn_drop)
-        self.mlp = MLP(dim, int(dim * mlp_ratio), drop)
-
-    def forward(self, x, auxiliary, mask = None):
-        x = x + self.attn(self.norm1(x), auxiliary)
-        x = x + self.mlp(self.norm2(x))
-
-        if mask is not None:
-            mask = mask.to(device = x.device, dtype = torch.bool)
-            x = x.masked_fill(~mask[:, :, None], 0)
-
-        return x

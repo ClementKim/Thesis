@@ -18,7 +18,6 @@ class CorrespondenceSelector(nn.Module):
             raise ValueError('position_dim must encode both image coordinates')
 
         self.embed_dim = embed_dim
-        self.evidence_dim = evidence_dim
         self.position_dim = position_dim
         self.scale = evidence_dim ** -0.5
 
@@ -97,7 +96,7 @@ class CorrespondenceSelector(nn.Module):
         context = context + self.spectral_projection(self.masked_mean(spectral, spectral_mask))
         keys, values = self.keys(records), self.values(records)
 
-        summaries, weights = [], []
+        summaries = []
         for index in range(self.num_tokens):
             features = context + self.slots[index]
             if summaries:
@@ -106,6 +105,5 @@ class CorrespondenceSelector(nn.Module):
             scores = torch.bmm(query[:, None, :], keys.transpose(1, 2)).squeeze(1) * self.scale
             attention = torch.softmax(scores.float().masked_fill(~record_mask, -torch.inf), dim = -1)
             summaries.append(torch.bmm(attention.to(values.dtype)[:, None, :], values).squeeze(1))
-            weights.append(attention)
 
-        return torch.stack(summaries, dim = 1), torch.stack(weights, dim = 1)
+        return torch.stack(summaries, dim = 1)

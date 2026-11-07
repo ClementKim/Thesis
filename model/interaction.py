@@ -5,16 +5,6 @@ import torch.nn.functional as F
 from .common import PatchEmbeddingLayer
 from .spectral import compressed_svd
 
-class Interaction(nn.Module):
-    def __init__(self, interaction_type):
-        super().__init__()
-
-        self.interaction_type = interaction_type
-
-    def forward(self, text, vision):
-        if self.interaction_type == "bilinear":
-            return torch.bmm(text, vision.transpose(1, 2))
-
 class SVDInteractionAdapter(nn.Module):
     def __init__(self, embed_dim, patch_size, svd_rank = 8):
         super().__init__()
@@ -24,7 +14,7 @@ class SVDInteractionAdapter(nn.Module):
                 raise ValueError(f'{name} must be a positive integer')
 
         self.svd_rank = svd_rank
-        self.patch_embed = PatchEmbeddingLayer(1, embed_dim, patch_size, is_cls_token = False)
+        self.patch_embed = PatchEmbeddingLayer(1, embed_dim, patch_size)
 
     def compress(self, similarity, text_mask, image_mask):
         if similarity.ndim != 3:
@@ -57,13 +47,10 @@ class SVDInteractionAdapter(nn.Module):
 
         return coefficients, component_mask
 
-    def forward(self, similarity, text_mask, image_mask = None, row_indices = None, column_indices = None):
+    def forward(self, similarity, text_mask, image_mask = None, column_indices = None):
         if image_mask is None:
             image_mask = torch.ones((similarity.size(0), similarity.size(2)), dtype = torch.bool, device = similarity.device)
         image_mask = image_mask.to(device = similarity.device, dtype = torch.bool)
-        if row_indices is not None and tuple(row_indices.shape) != tuple(text_mask.shape):
-            raise ValueError('Selected text indices must match the text mask')
-
         coefficients, component_mask = self.compress(similarity, text_mask, image_mask)
         map_mask = component_mask[:, :, None] & image_mask[:, None, :]
         interaction_map = coefficients.unsqueeze(1)
@@ -71,4 +58,4 @@ class SVDInteractionAdapter(nn.Module):
         tokens, token_mask = self.patch_embed(interaction_map.to(self.patch_embed.patchify.weight.dtype), mask = map_mask,
                                              column_indices = column_indices)
 
-        return tokens, interaction_map, map_mask, token_mask
+        return tokens, token_mask

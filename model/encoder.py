@@ -18,10 +18,6 @@ class CLIPEncoder(nn.Module):
             parameter.requires_grad = False
         self.model.eval()
 
-    @property
-    def config(self):
-        return self.model.config
-
 class TextEncoder(nn.Module):
     def __init__(self, CLIP, drop, out_dim = None, chunk_batch_size = 64, add_chunk_position = True):
         super().__init__()
@@ -91,7 +87,7 @@ class TextEncoder(nn.Module):
                 content_ids = content_ids[:-1]
 
             if content_ids.numel():
-                chunks = list(torch.split(content_ids, content_window))
+                chunks = torch.split(content_ids, content_window)
             else:
                 chunks = [content_ids]
 

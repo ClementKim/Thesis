@@ -1,5 +1,4 @@
 import inspect
-import re
 from contextlib import nullcontext
 
 import torch
@@ -25,42 +24,6 @@ MM_MARKER = '<|ipmoe_mm|>'
 
 # Fixed date so the chat template always gives the same tokens.
 FIXED_CHAT_DATE = '13 OCT 2026'
-
-# Matches option lines like "A. cat", "A) cat", "(A) cat" or "A cat".
-OPTION_LINE_RE = re.compile(r'^\s*(?:\(([A-H])\)|([A-H])(?:[\.)\:]|\s))\s*', flags = re.IGNORECASE)
-
-def extract_mcq_labels(question):
-    labels = []
-
-    for line in str(question).splitlines():
-        match = OPTION_LINE_RE.match(line)
-        if match is None:
-            continue
-
-        label = (match.group(1) or match.group(2)).upper()
-        if label not in labels:
-            labels.append(label)
-
-    # Require A, B, ... in order so regular text is not mistaken for options.
-    expected_labels = [chr(ord('A') + index) for index in range(len(labels))]
-    if len(labels) < 2 or labels != expected_labels:
-        return []
-
-    return labels
-
-def _format_question(question, enforce_mcq_format):
-    question = str(question)
-    if not enforce_mcq_format:
-        return question
-
-    labels = extract_mcq_labels(question)
-    if not labels:
-        return question
-
-    options = ', '.join(labels)
-    instruction = f'Answer with exactly one option letter ({options}). Do not provide an explanation.'
-
-    return f'{question}\n\n{instruction}'
 
 class NoValidTargetsError(ValueError):
     pass
@@ -214,7 +177,7 @@ class _PrefixLLM(nn.Module):
 
         return token_rows, label_rows, kept_rows, insert_positions
 
-    def tokenize_generation_chats(self, questions, max_prompt_tokens = 2048, enforce_mcq_format = True):
+    def tokenize_generation_chats(self, questions, max_prompt_tokens = 2048):
         token_rows = []
         insert_positions = []
 
@@ -223,7 +186,6 @@ class _PrefixLLM(nn.Module):
                 raise ValueError(f'Reserved multimodal marker in generation question: sample={row_index}')
             
             text_budget = max_prompt_tokens if isinstance(max_prompt_tokens, int) else max_prompt_tokens[row_index]
-            question = _format_question(question, enforce_mcq_format)
             user_message = {'role': 'user', 'content': f'{MM_MARKER}\n{question}'}
             prompt_ids, insert_position = self._tokenize_chat([user_message], add_generation_prompt = True)
 
@@ -237,7 +199,7 @@ class _PrefixLLM(nn.Module):
         return token_rows, insert_positions
 
     def _insert_prefix(self, token_rows, insert_positions, prefix, label_rows, prefix_mask = None):
-        B, P, H = prefix.shape
+        B = prefix.size(0)
         embed = self.model.get_input_embeddings()
         input_rows = []
         merged_label_rows = [] if label_rows is not None else None
@@ -323,7 +285,7 @@ class _PrefixLLM(nn.Module):
         if prefix.ndim != 3:
             raise ValueError(f'prefix must have shape (B, P, H), got {tuple(prefix.shape)}')
 
-        B, P, H = prefix.shape
+        B = prefix.size(0)
         if len(token_rows) != B:
             raise ValueError('token_rows batch does not match prefix batch')
         
@@ -341,7 +303,7 @@ class _PrefixLLM(nn.Module):
 
         return self._pad_inputs(input_rows, merged_label_rows)
 
-    def forward(self, input_embeds, attention_mask, position_ids, labels, optimize = True):
+    def forward(self, input_embeds, attention_mask, position_ids, labels):
         model_inputs = {
             'inputs_embeds': input_embeds,
             'attention_mask': attention_mask,
@@ -349,7 +311,7 @@ class _PrefixLLM(nn.Module):
             'use_cache': False,
         }
 
-        if not optimize or not self.logits_to_keep_supported:
+        if not self.logits_to_keep_supported:
             with self._autocast():
                 output = self.model(**model_inputs, labels = labels)
 
@@ -424,9 +386,3 @@ class Qwen25VLLLM(_PrefixLLM):
         # Interaction-prefix features use sequence positions on all three Qwen MRoPE axes.
         super().__init__(model_name, Qwen2_5_VLForConditionalGeneration, lora_rank, attn_implementation,
                          gradient_checkpointing, target_modules, torch_dtype)
-
-def llamaAPI(device, llm_size = 1, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
-    return LlamaLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype).to(device)
-
-def qwenAPI(device, llm_size = 3, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
-    return Qwen25VLLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype).to(device)

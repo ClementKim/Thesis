@@ -19,7 +19,6 @@ from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL
 
 # Proposed Method
 from model.encoder import encoding
-from model.interaction import Interaction
 from model.llm import LlamaLLM, Qwen25VLLLM, NoValidTargetsError
 
 from model.ipmoe import IPMoE
@@ -33,7 +32,6 @@ def reproduce(seed):
         np.random.seed(seed)
 
         torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -57,9 +55,6 @@ def build_model(device, args):
     if vision.image_size % vision.patch_size or vision.image_size // vision.patch_size != 24:
         raise ValueError('The interaction branch requires a 24 by 24 CLIP patch grid')
 
-    ## Interaction Matrix Constructor
-    interaction = Interaction(args.interaction_type)
-
     ## LLM
     dtype = torch.bfloat16 if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
@@ -69,25 +64,14 @@ def build_model(device, args):
     elif args.llm_type == "qwen":
         llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype)
 
-    return processor, text_encoder, vision_encoder, interaction, llm
+    return processor, text_encoder, vision_encoder, llm
 
-def batch_loss(model, batch, device, context_limit, return_stats = False, allow_empty = False):
+def batch_loss(model, batch, device, context_limit, allow_empty = False):
     _, question, text_inputs, image_inputs, answer = batch
     text_inputs = {key: value.to(device) for key, value in text_inputs.items()}
     image_inputs = {key: value.to(device) for key, value in image_inputs.items()}
 
-    return model(question, text_inputs, image_inputs, answer, context_limit, return_stats = return_stats, allow_empty = allow_empty)
-
-def train(model, batch, device, context_limit, return_stats = False, allow_empty = False):
-    model.train()
-
-    return batch_loss(model, batch, device, context_limit, return_stats, allow_empty)
-
-def val(model, batch, device, context_limit):
-    model.eval()
-
-    with torch.no_grad():
-        return batch_loss(model, batch, device, context_limit, return_stats = True)
+    return model(question, text_inputs, image_inputs, answer, context_limit, allow_empty = allow_empty)
 
 def setup_distributed():
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -118,10 +102,11 @@ def reduce_totals(values, device):
     return totals.tolist()
 
 def train_step(model, batch, optimizer, scheduler, device, context_limit, max_grad_norm):
+    model.train()
     optimizer.zero_grad(set_to_none = True)
     distributed = isinstance(model, DDP)
     try:
-        loss, weights, tokens = train(model, batch, device, context_limit, return_stats = True, allow_empty = distributed)
+        loss, retained, tokens = batch_loss(model, batch, device, context_limit, allow_empty = distributed)
 
     except NoValidTargetsError:
         return None, 0, None
@@ -146,19 +131,21 @@ def train_step(model, batch, optimizer, scheduler, device, context_limit, max_gr
     optimizer.step()
     scheduler.step()
 
-    return loss_sum / total_tokens, weights.size(0), grad_norm.item()
+    return loss_sum / total_tokens, retained, grad_norm.item()
 
+@torch.no_grad()
 def evaluate(model, loader, device, context_limit):
     """Evaluate disjoint shards without per-forward DDP communication."""
     if isinstance(model, DDP):
         model = model.module
+    model.eval()
 
     loss_sum, tokens, skipped, seen = 0.0, 0, 0, 0
     for batch in tqdm(loader):
         seen += len(batch[1])
 
         try:
-            loss, weights, batch_tokens = val(model, batch, device, context_limit)
+            loss, retained, batch_tokens = batch_loss(model, batch, device, context_limit)
 
         except NoValidTargetsError:
             skipped += len(batch[1])
@@ -167,7 +154,7 @@ def evaluate(model, loader, device, context_limit):
         loss_sum += loss.item() * batch_tokens
         tokens += batch_tokens
 
-        skipped += len(batch[1]) - weights.size(0)
+        skipped += len(batch[1]) - retained
 
     loss_sum, tokens, skipped, seen = reduce_totals([loss_sum, tokens, skipped, seen], device)
     return loss_sum / tokens if tokens else None, int(skipped), int(seen)
@@ -190,10 +177,10 @@ def run_training(args, device, rank, world_size):
         dist.barrier()
 
     ## Model Building
-    processor, text_encoder, vision_encoder, interaction, llm = build_model(device, args)
+    processor, text_encoder, vision_encoder, llm = build_model(device, args)
     config = configure_model(args)
-    model_options = {field: value for field, value in config.items() if field not in ('architecture', 'interaction_type')}
-    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, llm, **model_options).to(device)
+    model_options = {field: value for field, value in config.items() if field not in ('architecture', 'interaction_type', 'drop')}
+    ipmoe = IPMoE(text_encoder, vision_encoder, llm, **model_options).to(device)
     model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None, broadcast_buffers = False) if distributed else ipmoe
     
     # Start from identical weights, then use independent dropout streams per rank.

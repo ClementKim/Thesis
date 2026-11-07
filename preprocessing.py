@@ -125,12 +125,8 @@ def iter_rows(name, columns, *, desc = None, batch_size = 64):
     """Read small batches of parquet rows without decoding their images."""
     files = parquet_files(name)
 
-    # Read only the metadata to get the progress bar's total.
-    total = None
-    if desc:
-        total = 0
-        for path in files:
-            total += pq.ParquetFile(path).metadata.num_rows
+    # Reuse the row count already validated by parquet_files.
+    total = SOURCES[name]['expected_rows'] if desc else None
 
     with tqdm(total = total, desc = desc, disable = desc is None) as progress:
         for path in files:

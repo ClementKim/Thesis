@@ -7,15 +7,13 @@ from .llm import NoValidTargetsError
 from .selector import TokenSelector
 
 class IPMoE(nn.Module):
-    def __init__(self, processor, text_encoder, vision_encoder, interaction, llm, embed_dim, patch_size,
-                 svd_rank = 8, evidence_dim = 64, position_dim = 16, drop = 0.0,
+    def __init__(self, text_encoder, vision_encoder, llm, embed_dim, patch_size,
+                 svd_rank = 8, evidence_dim = 64, position_dim = 16,
                  selector_keep_ratio = 0.5, image_keep_ratio = 0.5, selector_dim = 64, selector_temperature = 1.0):
         super().__init__()
 
-        self.processor = processor
         self.text_encoder = text_encoder
         self.vision_encoder = vision_encoder
-        self.interaction = interaction
         self.llm = llm
 
         ## Compressed Interaction Prefix and Two Soft Evidence Tokens
@@ -38,23 +36,22 @@ class IPMoE(nn.Module):
         selected_image, selected_image_mask, image_indices = self.image_selector(image_features, image_mask, text_features, text_mask)
 
         # Select both subsets before constructing their text-by-image map.
-        similarity = self.interaction(selected_text, selected_image)
-        interaction_tokens, _, _, token_mask = self.interaction_adapter(similarity, selected_text_mask, selected_image_mask,
-                                                                       row_indices = text_indices, column_indices = image_indices)
+        similarity = torch.bmm(selected_text, selected_image.transpose(1, 2))
+        interaction_tokens, token_mask = self.interaction_adapter(similarity, selected_text_mask, selected_image_mask,
+                                                                  column_indices = image_indices)
 
         vision = self.vision_encoder.clip.config.vision_config
         grid_size = int(vision.image_size) // int(vision.patch_size)
-        evidence, _ = self.evidence_selector(similarity, selected_text, selected_text_mask, selected_image_mask,
-                                             text_indices, image_indices, text_features, text_mask,
-                                             interaction_tokens, token_mask, grid_size)
+        evidence = self.evidence_selector(similarity, selected_text, selected_text_mask, selected_image_mask,
+                                          text_indices, image_indices, text_features, text_mask,
+                                          interaction_tokens, token_mask, grid_size)
 
         # The original question is tokenized separately by the LLM, unchanged.
         prefix = torch.cat((self.interaction_head(interaction_tokens), self.evidence_head(evidence)), dim = 1)
         prefix_mask = torch.cat((token_mask, torch.ones(evidence.shape[:2], dtype = torch.bool, device = token_mask.device)), dim = 1)
         prefix = prefix.masked_fill(~prefix_mask[:, :, None], 0)
-        weights = image_features.new_empty((image_features.size(0), 0))
 
-        return prefix, prefix_mask, weights
+        return prefix, prefix_mask
 
     def _prefix_lengths(self, text_inputs, image_inputs):
         vision = self.vision_encoder.clip.config.vision_config
@@ -96,7 +93,7 @@ class IPMoE(nn.Module):
         
         return lengths
 
-    def forward(self, questions, text_inputs, image_inputs, answers, context_limit, return_stats = False, allow_empty = False):
+    def forward(self, questions, text_inputs, image_inputs, answers, context_limit, allow_empty = False):
         prefix_lengths = self._prefix_lengths(text_inputs, image_inputs)
         text_budget = [context_limit - length for length in prefix_lengths]
 
@@ -110,14 +107,13 @@ class IPMoE(nn.Module):
 
             # Empty DDP ranks must still participate in every gradient reduction.
             loss = sum(parameter.reshape(-1)[0].float() * 0 for parameter in self.parameters() if parameter.requires_grad)
-            weights = self.interaction_head.weight.new_empty((0, 0))
-            return (loss, weights, 0) if return_stats else (loss, weights)
+            return loss, 0, 0
 
         # The tokenizer raises NoValidTargetsError before encoding an empty selection.
         def select(inputs):
             return {key: value.index_select(0, torch.tensor(kept_rows, device = value.device, dtype = torch.long)) for key, value in inputs.items()}
 
-        prefix, prefix_mask, weights = self.encode_prefix(select(text_inputs), select(image_inputs))
+        prefix, prefix_mask = self.encode_prefix(select(text_inputs), select(image_inputs))
         expected = [prefix_lengths[index] for index in kept_rows]
         if prefix_mask.sum(dim = 1).tolist() != expected:
             raise RuntimeError('Predicted prefix lengths disagree with encoded prefix lengths')
@@ -125,21 +121,18 @@ class IPMoE(nn.Module):
         embeds, mask, position_ids, labels = self.llm.build_inputs(token_rows, positions, prefix, label_rows, prefix_mask = prefix_mask)
         loss = self.llm(embeds, mask, position_ids, labels)
 
-        if return_stats:
-            return loss, weights, (labels[:, 1:] != -100).sum().item()
-
-        return loss, weights
+        return loss, len(kept_rows), (labels[:, 1:] != -100).sum().item()
 
     @torch.no_grad()
-    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True):
+    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32):
         if self.training:
             raise RuntimeError('Call model.eval() before generation')
         
-        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
+        prefix, prefix_mask = self.encode_prefix(text_inputs, image_inputs)
         text_budget = [context_limit - length - max_new_tokens for length in prefix_mask.sum(dim = 1).tolist()]
 
-        token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget, enforce_mcq_format = enforce_mcq_format)
+        token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget)
         embeds, mask, _, _ = self.llm.build_inputs(token_rows, positions, prefix, prefix_mask = prefix_mask)
         answers = self.llm.generate(embeds, mask, max_new_tokens = max_new_tokens)
 
-        return answers, weights
+        return answers
