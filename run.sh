@@ -23,7 +23,7 @@ for SEED in $SEEDS; do
         --attn-implementation flash_attention_2 \
         --llm-type "$LLM_TYPE" \
         --output-dir "$OUTPUT_DIR" \
-        --batch-size 6 "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
+        --batch-size 30 "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
 
     # Keep going after a failed run; the log keeps its traceback.
     if [ "${PIPESTATUS[0]}" -ne 0 ]; then

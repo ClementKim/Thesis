@@ -114,10 +114,11 @@ class TextEncoder(nn.Module):
 
         for start in range(0, chunk_ids.size(0), self.chunk_batch_size):
             end = min(start + self.chunk_batch_size, chunk_ids.size(0))
-            with torch.no_grad():
+            # Only frozen CLIP uses FP16; the trainable projection stays FP32.
+            with torch.no_grad(), torch.autocast('cuda', dtype = torch.float16, enabled = chunk_ids.is_cuda):
                 hidden = self.clip.text_model(input_ids = chunk_ids[start:end], attention_mask = chunk_mask[start:end]).last_hidden_state
                 projected = self.clip.text_projection(hidden)
-            encoded_batches.append(self.mlp(projected))
+            encoded_batches.append(self.mlp(projected.float()))
 
         return torch.cat(encoded_batches, dim = 0)
 
@@ -171,12 +172,12 @@ class VisionEncoder(nn.Module):
         return self
 
     def forward(self, pixel_values, **kwargs):
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast('cuda', dtype = torch.float16, enabled = pixel_values.is_cuda):
             outputs = self.clip.vision_model(pixel_values = pixel_values, output_hidden_states = True)
             # Use the penultimate block's patch tokens, excluding the class token.
             patches = outputs.hidden_states[-2][:, 1:]
 
-        return self.mlp(patches)
+        return self.mlp(patches.float())
 
 def encoding(drop, device, out_dim = None):
     image_size = int(CLIPConfig.from_pretrained(MODEL_NAME).vision_config.image_size)

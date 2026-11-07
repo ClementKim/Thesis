@@ -358,7 +358,7 @@ class _PrefixLLM(nn.Module):
         return [prediction.strip() for prediction in decoded]
 
 class LlamaLLM(_PrefixLLM):
-    def __init__(self, llm_size = 1, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+    def __init__(self, llm_size = 1, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float16):
         if llm_size not in MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(MODEL_NAMES)}')
 
