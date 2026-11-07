@@ -1,5 +1,5 @@
 # Model integration tested with these Transformers/PEFT/Accelerate versions.
-# Install the appropriate PyTorch build for your CPU/CUDA platform first.
+# Install the appropriate CUDA-enabled PyTorch build and CUDA toolkit first.
 torch>=2.5,<3
 numpy>=1.26,<3
 transformers==4.57.1
@@ -9,3 +9,4 @@ huggingface-hub>=0.34,<1
 pillow>=10
 pyarrow>=16
 tqdm>=4.66
+flash-attn==2.8.3
