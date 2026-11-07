@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import get_cosine_schedule_with_warmup
 
-from ablation import ABLATIONS, configure_ablation
+from configuration import MODEL_DEFAULTS, configure_model
 
 # Dataset
 from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL, SOURCES
@@ -20,8 +20,6 @@ from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL
 # Proposed Method
 from model.encoder import encoding
 from model.interaction import Interaction
-from model.experts import SelfExpert, CrossExpert, HybridExpert
-from model.router import MoE
 from model.llm import LlamaLLM, Qwen25VLLLM, NoValidTargetsError
 
 from model.ipmoe import IPMoE
@@ -50,32 +48,17 @@ def reproduce(seed):
         raise RuntimeError(f"Failed to set random seed: {e}")
 
 def build_model(device, args):
-    ablation = configure_ablation(args)
-
-    if args.embed_dim <= 0 or args.num_heads <= 0 or args.embed_dim % args.num_heads:
-        raise ValueError('embed_dim must be positive and divisible by positive num_heads')
-    
-    if args.patch_size <= 0:
-        raise ValueError('patch_size must be positive')
+    configure_model(args)
 
     ## CLIP
     processor, text_encoder, vision_encoder = encoding(args.drop, device, args.embed_dim)
 
     vision = text_encoder.clip.config.vision_config
     if vision.image_size % vision.patch_size or vision.image_size // vision.patch_size != 24:
-        raise ValueError('The router requires a 24 by 24 CLIP patch grid')
+        raise ValueError('The interaction branch requires a 24 by 24 CLIP patch grid')
 
     ## Interaction Matrix Constructor
     interaction = Interaction(args.interaction_type)
-
-    ## Experts
-    self_expert = SelfExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
-    cross_expert = CrossExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
-    hybrid_expert = HybridExpert(args.patch_size, 1, args.embed_dim, args.num_heads, args.mlp_ratio, args.drop, args.attn_drop, False)
-
-    ## Router
-    moe = MoE(1, self_expert, cross_expert, hybrid_expert, router_mode = ablation['router_mode'],
-              expert_set = ablation.get('expert_set', 'all'))
 
     ## LLM
     dtype = torch.bfloat16 if torch.device(device).type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
@@ -86,7 +69,7 @@ def build_model(device, args):
     elif args.llm_type == "qwen":
         llm = Qwen25VLLLM(args.llm_size, args.lora_rank, args.attn_implementation, args.gradient_checkpointing, dtype)
 
-    return processor, text_encoder, vision_encoder, interaction, moe, llm
+    return processor, text_encoder, vision_encoder, interaction, llm
 
 def batch_loss(model, batch, device, context_limit, return_stats = False, allow_empty = False):
     _, question, text_inputs, image_inputs, answer = batch
@@ -207,9 +190,10 @@ def run_training(args, device, rank, world_size):
         dist.barrier()
 
     ## Model Building
-    processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(device, args)
-    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm,
-                  args.embed_dim, args.patch_size, args.num_aux_tokens, ablation = args.ablation_config).to(device)
+    processor, text_encoder, vision_encoder, interaction, llm = build_model(device, args)
+    config = configure_model(args)
+    model_options = {field: value for field, value in config.items() if field not in ('architecture', 'interaction_type')}
+    ipmoe = IPMoE(processor, text_encoder, vision_encoder, interaction, llm, **model_options).to(device)
     model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None, broadcast_buffers = False) if distributed else ipmoe
     
     # Start from identical weights, then use independent dropout streams per rank.
@@ -308,18 +292,19 @@ def parse_args():
     parser.add_argument('--data-seed', type = int, default = 42)
 
     parser.add_argument('--interaction-type', choices = ['bilinear'], default = 'bilinear')
-    parser.add_argument('--ablation', choices = list(ABLATIONS), default = 'full')
-
     parser.add_argument('--patch-size', type = int, default = 16)
-    parser.add_argument('--embed-dim', type = int, default = 1024)
-    parser.add_argument('--num-heads', type = int, default = 16)
-    parser.add_argument('--num-aux-tokens', type = int, default = 32)
-    parser.add_argument('--mlp-ratio', type = float, default = 2.0)
+    parser.add_argument('--embed-dim', type = int, default = MODEL_DEFAULTS['embed_dim'])
+    parser.add_argument('--svd-rank', type = int, default = MODEL_DEFAULTS['svd_rank'])
+    parser.add_argument('--evidence-dim', type = int, default = MODEL_DEFAULTS['evidence_dim'])
+    parser.add_argument('--position-dim', type = int, default = MODEL_DEFAULTS['position_dim'])
     parser.add_argument('--drop', type = float, default = 0.0)
-    parser.add_argument('--attn-drop', type = float, default = 0.0)
+    parser.add_argument('--selector-keep-ratio', type = float, default = 0.5)
+    parser.add_argument('--image-keep-ratio', type = float, default = 0.5)
+    parser.add_argument('--selector-dim', type = int, default = MODEL_DEFAULTS['selector_dim'])
+    parser.add_argument('--selector-temperature', type = float, default = 1.0)
     parser.add_argument('--llm-type', choices = ['llama', 'qwen'], default = 'llama')
     parser.add_argument('--llm-size', type = int, default = 3)
-    parser.add_argument('--lora-rank', type = int, default = 64)
+    parser.add_argument('--lora-rank', type = int, default = 16)
     parser.add_argument('--attn-implementation', default = 'flash_attention_2')
 
     parser.add_argument('--gradient-checkpointing', action = argparse.BooleanOptionalAction, default = True)
@@ -335,7 +320,9 @@ def parse_args():
     args = parser.parse_args()
 
     if args.output_dir is None:
-        args.output_dir = 'checkpoint' if args.ablation == 'full' else os.path.join('checkpoint', 'ablations', args.ablation, f'seed_{args.seed}')
+        args.output_dir = os.path.join('checkpoint', MODEL_DEFAULTS['architecture'], f'seed_{args.seed}')
+
+    configure_model(args)
 
     return args
 

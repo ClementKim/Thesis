@@ -1,5 +1,3 @@
-import bisect
-import hashlib
 import logging
 import os
 import string
@@ -11,10 +9,9 @@ import torch
 from PIL import Image
 from vlmeval.dataset.image_mcq import CVBench, ImageMCQDataset
 from vlmeval.dataset.image_yorn import ImageYORNDataset
-from vlmeval.smp import LMUDataRoot
 from vlmeval.vlm.base import BaseModel
 
-from ablation import configure_ablation
+from configuration import configure_model
 from main import build_model
 from model.ipmoe import IPMoE
 
@@ -25,18 +22,6 @@ SHORT_ANSWER_INSTRUCTION = 'Answer the question using a single word or phrase.'
 # Plain question-and-options datasets; subclasses with their own prompts (e.g. NaturalBench) keep them.
 MCQ_DATASETS = set(ImageMCQDataset.supported_datasets()) | set(CVBench.supported_datasets())
 YORN_DATASETS = set(ImageYORNDataset.supported_datasets())
-
-# Test-time interventions on a trained checkpoint, chosen with IPMOE_INTERVENTION (see rebuttal.sh):
-# swap builds the interaction map from another image of the same benchmark while the image tokens keep the true one,
-# mean averages the shared map over patches as all_map_mean does, uniform replaces the learned weights with 1/3, and
-# zero_<expert> sets that expert's learned weight to 0 without renormalizing the other two.
-EXPERTS = ('self', 'cross', 'hybrid')
-INTERVENTIONS = ('swap', 'mean', 'uniform', *(f'zero_{expert}' for expert in EXPERTS))
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')
-
-def _file_sha256(path):
-    with open(path, 'rb') as handle:
-        return hashlib.sha256(handle.read()).hexdigest()
 
 def _option_text(value):
     # Option columns with blanks load as floats, which would turn a count of 1 into "1.0".
@@ -60,6 +45,9 @@ class IPMoEVLMEval(BaseModel):
     def __init__(self, checkpoint_path, max_new_tokens = 128, context_limit = None):
         super().__init__()
 
+        if os.environ.get('IPMOE_INTERVENTION'):
+            raise ValueError('IPMOE_INTERVENTION is no longer supported; evaluation uses the single svd_evidence_prefix architecture')
+
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError('max_new_tokens must be a positive integer')
         if context_limit is not None and (type(context_limit) is not int or context_limit <= max_new_tokens):
@@ -69,16 +57,13 @@ class IPMoEVLMEval(BaseModel):
         checkpoint = torch.load(checkpoint_path, map_location = 'cpu', weights_only = True)
         args = Namespace(**checkpoint['args'])
 
-        if not hasattr(args, 'num_aux_tokens'):
-            raise ValueError('Checkpoint is missing num_aux_tokens')
-
-        configure_ablation(args, checkpoint = True)
+        model_config = configure_model(args, checkpoint = True)
         args.gradient_checkpointing = False
 
         self.max_new_tokens = max_new_tokens
 
         ## Model Building
-        processor, text_encoder, vision_encoder, interaction, moe, llm = build_model(self.device, args)
+        processor, text_encoder, vision_encoder, interaction, llm = build_model(self.device, args)
         # The checkpoint's context_limit is a training memory budget. Inference
         # keeps the complete prefix and question up to the decoder's capacity.
         config = llm.model.config
@@ -91,9 +76,8 @@ class IPMoEVLMEval(BaseModel):
         logging.getLogger(f'vlmeval.{__name__}').info('Context tokens: inference=%s, training=%s, decoder=%s, max_new_tokens=%s',
                                                     self.context_limit, args.context_limit, model_context_limit, max_new_tokens)
         self.processor = processor
-        self.model = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm,
-                           args.embed_dim, args.patch_size, args.num_aux_tokens,
-                           ablation = args.ablation_config).to(self.device)
+        model_options = {field: value for field, value in model_config.items() if field not in ('architecture', 'interaction_type')}
+        self.model = IPMoE(processor, text_encoder, vision_encoder, interaction, llm, **model_options).to(self.device)
 
         ## Load Trained Parameters
         parameters = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
@@ -122,66 +106,6 @@ class IPMoEVLMEval(BaseModel):
                 parameter.copy_(saved[name])
 
         self.model.eval()
-
-        self.intervention = os.environ.get('IPMOE_INTERVENTION') or None
-        self._swap_images = {}
-        if self.intervention is not None:
-            self._apply_intervention(self.intervention)
-
-    def _apply_intervention(self, name):
-        if name not in INTERVENTIONS:
-            raise ValueError(f'Unknown IPMOE_INTERVENTION {name!r}; choose from {INTERVENTIONS}')
-
-        ablation, moe = self.model.ablation, self.model.moe
-        if ablation.get('prefix', 'full') == 'image':
-            raise ValueError('The image_only arm has no interaction map to intervene on')
-        if name == 'mean':
-            if ablation.get('shared_map', 'full') != 'full':
-                raise ValueError('This arm already averages its shared map')
-            # IPMoE.encode_prefix reads the configuration on every call.
-            ablation['shared_map'] = 'spatial_mean'
-        elif name != 'swap':
-            if moe.router_mode != 'learned' or moe.expert_set != 'all':
-                raise ValueError(f'{name} requires a learned router over all three experts')
-            if name == 'uniform':
-                moe.router_mode = 'uniform'
-            else:
-                column = EXPERTS.index(name[len('zero_'):])
-                route = moe.router.forward
-
-                def zeroed(*args, **kwargs):
-                    weights = route(*args, **kwargs).clone()
-                    weights[:, column] = 0
-
-                    return weights
-
-                moe.router.forward = zeroed
-
-        logging.getLogger(f'vlmeval.{__name__}').warning('Test-time intervention: %s', name)
-
-    def _swap_image(self, path):
-        """A fixed image of the same benchmark whose content differs from this one; identical across ranks and runs."""
-        images = os.path.join(LMUDataRoot(), 'images')
-        path = os.path.abspath(path)
-        relative = os.path.relpath(path, images)
-        root = os.path.dirname(path) if relative.startswith('..') else os.path.join(images, relative.split(os.sep)[0])
-
-        if root not in self._swap_images:
-            # Benchmarks reuse images across questions (MMBench's circular copies, POPE, CV-Bench), so pair contents, not files.
-            first = {}
-            for directory, _, files in sorted(os.walk(root)):
-                for file in sorted(files):
-                    if file.lower().endswith(IMAGE_EXTENSIONS):
-                        first.setdefault(_file_sha256(os.path.join(directory, file)), os.path.join(directory, file))
-            if len(first) < 2:
-                raise ValueError(f'swap needs at least two distinct images under {root}')
-            self._swap_images[root] = (sorted(first), first)
-
-        digests, first = self._swap_images[root]
-        # Hash order is unrelated to content, so half-way round it lies an unrelated image, never this one.
-        position = bisect.bisect_left(digests, _file_sha256(path))
-
-        return first[digests[(position + len(digests) // 2) % len(digests)]]
 
     def use_custom_prompt(self, dataset):
         return dataset in MCQ_DATASETS or dataset in YORN_DATASETS
@@ -214,15 +138,8 @@ class IPMoEVLMEval(BaseModel):
         text_inputs = {key: value.to(self.device) for key, value in text_inputs.items()}
         image_inputs = {key: value.to(self.device) for key, value in image_inputs.items()}
 
-        map_image_inputs = None
-        if self.intervention == 'swap':
-            with Image.open(self._swap_image(images[0])) as image:
-                map_image_inputs = self.processor.image_processor(images = [image.convert('RGB')], return_tensors = 'pt')
-            map_image_inputs = {key: value.to(self.device) for key, value in map_image_inputs.items()}
-
         ## Generate Answer
         answers, _ = self.model.generate([question], text_inputs, image_inputs, self.context_limit,
-                                         max_new_tokens = self.max_new_tokens, enforce_mcq_format = False,
-                                         map_image_inputs = map_image_inputs)
+                                         max_new_tokens = self.max_new_tokens, enforce_mcq_format = False)
 
         return answers[0]

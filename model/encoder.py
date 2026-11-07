@@ -40,7 +40,8 @@ class TextEncoder(nn.Module):
         else:
             self.register_parameter('chunk_position_scale', None)
 
-        self.mlp = nn.Sequential(nn.Linear(projection_dim, projection_dim), nn.GELU(), nn.Dropout(drop), nn.Linear(projection_dim, out_dim))
+        hidden_dim = min(projection_dim, out_dim)
+        self.mlp = nn.Sequential(nn.Linear(projection_dim, hidden_dim), nn.GELU(), nn.Dropout(drop), nn.Linear(hidden_dim, out_dim))
 
     def train(self, mode = True):
         super().train(mode)
@@ -164,7 +165,8 @@ class VisionEncoder(nn.Module):
         if out_dim is None:
             out_dim = projection_dim
 
-        self.mlp = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, feature_dim), nn.GELU(), nn.Dropout(drop), nn.Linear(feature_dim, out_dim))
+        hidden_dim = min(feature_dim, out_dim)
+        self.mlp = nn.Sequential(nn.LayerNorm(feature_dim), nn.Linear(feature_dim, hidden_dim), nn.GELU(), nn.Dropout(drop), nn.Linear(hidden_dim, out_dim))
 
     def train(self, mode = True):
         super().train(mode)

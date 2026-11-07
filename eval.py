@@ -183,7 +183,7 @@ def main():
         from vlmeval_baselines import BASELINES
 
         reproduce(seed)
-        checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/seed_{seed}/checkpoint.pt')
+        checkpoint_path = os.environ.get('IPMOE_CHECKPOINT', f'checkpoint/svd_evidence_prefix/seed_{seed}/checkpoint.pt')
         checkpoint_path = os.path.abspath(checkpoint_path)
         context_limit = os.environ.get('IPMOE_CONTEXT_LIMIT')
         context_limit = int(context_limit) if context_limit is not None else None

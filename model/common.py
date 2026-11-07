@@ -17,8 +17,12 @@ class PatchEmbeddingLayer(nn.Module):
         if self.is_cls_token:
             self.cls_token = nn.Parameter(torch.randn((1, 1, embed_dim)))
 
-    def forward(self, x, mask = None):
+    def forward(self, x, mask = None, row_indices = None, column_indices = None):
         B, C, H, W = x.shape
+
+        for indices, length in ((row_indices, H), (column_indices, W)):
+            if indices is not None and tuple(indices.shape) != (B, length):
+                raise ValueError('Selected indices must match the map batch and axis dimensions')
 
         if mask is None:
             mask = torch.ones((B, H, W), dtype = torch.bool, device = x.device)
@@ -38,20 +42,28 @@ class PatchEmbeddingLayer(nn.Module):
 
         x = self.linear(x)
 
-        # Absolute row/column positions do not change when another sample adds padding.
+        # Retain original map-block coordinates after selection; ignore padded indices.
         positions = []
-        for length, D in ((H, self.embed_dim // 2), (W, self.embed_dim - self.embed_dim // 2)):
-            coordinates = torch.arange(length, device = x.device, dtype = torch.float32)[:, None]
+        for length, D, indices in ((H, self.embed_dim // 2, row_indices), (W, self.embed_dim - self.embed_dim // 2, column_indices)):
+            if indices is None:
+                coordinates = torch.arange(length, device = x.device, dtype = torch.float32)[None].expand(B, -1)
+            else:
+                indices = indices.to(device = x.device)
+                indices = F.pad(indices, (0, length * self.patch_size - indices.size(1)), value = -1)
+                indices = indices.reshape(B, length, self.patch_size)
+                valid = indices >= 0
+                coordinates = torch.div(indices.clamp_min(0), self.patch_size, rounding_mode = 'floor').float()
+                coordinates = coordinates.sum(dim = -1) / valid.sum(dim = -1).clamp_min(1)
             frequencies = torch.exp(-math.log(10000.0) * torch.arange(0, D, 2, device = x.device).float() / max(D, 1))
-            angles = coordinates * frequencies[None]
-            position = torch.zeros((length, D), device = x.device)
-            position[:, 0::2] = angles.sin()
-            position[:, 1::2] = angles[:, :D // 2].cos()
+            angles = coordinates[:, :, None] * frequencies[None, None]
+            position = torch.zeros((B, length, D), device = x.device)
+            position[:, :, 0::2] = angles.sin()
+            position[:, :, 1::2] = angles[:, :, :D // 2].cos()
             positions.append(position)
 
-        positional_embedding = torch.cat((positions[0][:, None].expand(-1, W, -1), positions[1][None].expand(H, -1, -1)), dim = -1)
+        positional_embedding = torch.cat((positions[0][:, :, None].expand(-1, -1, W, -1), positions[1][:, None].expand(-1, H, -1, -1)), dim = -1)
 
-        x = x + positional_embedding.reshape(1, H * W, self.embed_dim).to(x.dtype)
+        x = x + positional_embedding.reshape(B, H * W, self.embed_dim).to(x.dtype)
         x = x.masked_fill(~mask[:, :, None], 0)
 
         if self.is_cls_token:

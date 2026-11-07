@@ -1,12 +1,9 @@
 #!/usr/bin/bash
-# Evaluate every ablation arm in ablation.py for each seed, finishing all arms of one seed before the next.
-# Choose a subset with environment variables, e.g. SEEDS=42 ABLATIONS="full uniform" DATASETS="MMStar POPE" ./eval.sh
-# JUDGE extracts answers that rule-based matching cannot parse; gpt-6-luna reads OPENAI_API_KEY from VLMEvalKit/.env.
-# JUDGE=exact_matching scores every benchmark without an LLM.
+# Evaluate one SVD evidence-prefix checkpoint per seed.
+# Example: SEEDS="42 43 44" DATASETS="MMStar POPE" ./eval.sh
+# CHECKPOINT_DIR and OUT default to the svd_evidence_prefix training/results directories.
+# JUDGE=exact_matching avoids an LLM judge; other judges need their API credentials.
 # Extra arguments go to eval.py, e.g. ./eval.sh --judge-api-nproc 8
-# FULL_DIR holds the full-model seeds (checkpoint by default, where run.sh writes them; checkpoint/llama once moved)
-# and OUT the results, e.g. FULL_DIR=checkpoint/llama OUT=evaluation/llama ABLATIONS=full ./eval.sh
-# IPMOE_INTERVENTION applies a test-time intervention (see vlmeval_adapter.py); give it its own OUT.
 # Inference uses the decoder's context capacity, independent of the training cap.
 # Set IPMOE_CONTEXT_LIMIT=16384 to impose a smaller total token budget if needed.
 #
@@ -21,21 +18,11 @@ export PYTHONPATH="$PWD/VLMEvalKit${PYTHONPATH:+:$PYTHONPATH}"
 # torchrun exits normally on Ctrl-C, so without this the loop would move on to the next run.
 trap 'exit 130' INT
 
-ALL_ABLATIONS=$(python -c 'from ablation import ABLATIONS; print(*ABLATIONS)') || exit 1
 SEEDS=${SEEDS:-"42"}
-ABLATIONS=${ABLATIONS:-$ALL_ABLATIONS}
 DATASETS=${DATASETS:-"NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
 JUDGE=${JUDGE:-gpt-6-luna}
-FULL_DIR=${FULL_DIR:-checkpoint}
-OUT=${OUT:-evaluation}
-
-# Reject typos now rather than after hours of other evaluations.
-for ABLATION in $ABLATIONS; do
-    if [[ " $ALL_ABLATIONS " != *" $ABLATION "* ]]; then
-        echo "Unknown ablation '$ABLATION'; choose from: $ALL_ABLATIONS" >&2
-        exit 1
-    fi
-done
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-checkpoint/svd_evidence_prefix}
+OUT=${OUT:-evaluation/svd_evidence_prefix}
 
 # Each scoring group below sets its own datasets and judge.
 for ARG in "$@"; do
@@ -74,41 +61,30 @@ fi
 
 FAILED=()
 for SEED in $SEEDS; do
-    for ABLATION in $ABLATIONS; do
-        # Load the checkpoint run.sh wrote and mirror its layout under OUT.
-        if [ "$ABLATION" = full ]; then
-            CHECKPOINT=$FULL_DIR/seed_$SEED/checkpoint.pt
-            WORK_DIR=$OUT/seed_$SEED
-        else
-            CHECKPOINT=checkpoint/ablations/$ABLATION/seed_$SEED/checkpoint.pt
-            WORK_DIR=$OUT/ablations/$ABLATION/seed_$SEED
+    CHECKPOINT=$CHECKPOINT_DIR/seed_$SEED/checkpoint.pt
+    WORK_DIR=$OUT/seed_$SEED
+    if [ ! -f "$CHECKPOINT" ]; then
+        echo "=== Skipping seed=$SEED: $CHECKPOINT not found" >&2
+        FAILED+=("seed_$SEED (no checkpoint)")
+        continue
+    fi
+    mkdir -p "$WORK_DIR"
+    : > "$WORK_DIR/eval.log"
+
+    for PROTOCOL in "${PROTOCOLS[@]}"; do
+        read -r RUN_JUDGE RUN_DATASETS <<< "$PROTOCOL"
+        echo "=== $(date '+%F %T') architecture=svd_evidence_prefix seed=$SEED judge=$RUN_JUDGE data=[$RUN_DATASETS] checkpoint=$CHECKPOINT" \
+            | tee -a "$WORK_DIR/eval.log"
+        PYTHONHASHSEED="$SEED" IPMOE_CHECKPOINT="$CHECKPOINT" torchrun --standalone --nproc-per-node=gpu eval.py \
+            --model IPMoE \
+            --data $RUN_DATASETS \
+            --work-dir "$WORK_DIR" \
+            --judge "$RUN_JUDGE" \
+            "$@" 2>&1 | tee -a "$WORK_DIR/eval.log"
+
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            FAILED+=("seed_$SEED judge=$RUN_JUDGE (see $WORK_DIR/eval.log)")
         fi
-
-        # Arms still training, or whose training failed, have no checkpoint yet.
-        if [ ! -f "$CHECKPOINT" ]; then
-            echo "=== Skipping ablation=$ABLATION seed=$SEED: $CHECKPOINT not found" >&2
-            FAILED+=("$ABLATION/seed_$SEED (no checkpoint)")
-            continue
-        fi
-        mkdir -p "$WORK_DIR"
-        : > "$WORK_DIR/eval.log"
-
-        for PROTOCOL in "${PROTOCOLS[@]}"; do
-            read -r RUN_JUDGE RUN_DATASETS <<< "$PROTOCOL"
-            echo "=== $(date '+%F %T') ablation=$ABLATION seed=$SEED judge=$RUN_JUDGE data=[$RUN_DATASETS] checkpoint=$CHECKPOINT intervention=${IPMOE_INTERVENTION:-none}" \
-                | tee -a "$WORK_DIR/eval.log"
-            PYTHONHASHSEED="$SEED" IPMOE_CHECKPOINT="$CHECKPOINT" torchrun --standalone --nproc-per-node=gpu eval.py \
-                --model IPMoE \
-                --data $RUN_DATASETS \
-                --work-dir "$WORK_DIR" \
-                --judge "$RUN_JUDGE" \
-                "$@" 2>&1 | tee -a "$WORK_DIR/eval.log"
-
-            # Keep going after a failed evaluation; the log keeps its traceback.
-            if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-                FAILED+=("$ABLATION/seed_$SEED judge=$RUN_JUDGE (see $WORK_DIR/eval.log)")
-            fi
-        done
     done
 done
 

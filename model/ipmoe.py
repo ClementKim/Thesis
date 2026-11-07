@@ -1,79 +1,58 @@
 import torch
 import torch.nn as nn
 
-from ablation import ABLATIONS, select_interaction_map
-
-from .interaction import InteractionAdapter
+from .interaction import SVDInteractionAdapter
+from .evidence import CorrespondenceSelector
 from .llm import NoValidTargetsError
+from .selector import TokenSelector
 
 class IPMoE(nn.Module):
-    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size, num_aux_tokens, ablation = None):
+    def __init__(self, processor, text_encoder, vision_encoder, interaction, llm, embed_dim, patch_size,
+                 svd_rank = 8, evidence_dim = 64, position_dim = 16, drop = 0.0,
+                 selector_keep_ratio = 0.5, image_keep_ratio = 0.5, selector_dim = 64, selector_temperature = 1.0):
         super().__init__()
-
-        if num_aux_tokens < 2:
-            raise ValueError('num_aux_tokens must be at least 2')
 
         self.processor = processor
         self.text_encoder = text_encoder
         self.vision_encoder = vision_encoder
         self.interaction = interaction
-        self.moe = moe
         self.llm = llm
 
-        self.ablation = dict(ABLATIONS['full'] if ablation is None else ablation)
-        if self.ablation not in ABLATIONS.values():
-            raise ValueError('Unsupported ablation configuration')
-        if self.moe.router_mode != self.ablation['router_mode']:
-            raise ValueError('Router mode differs from the ablation configuration')
-        if self.moe.expert_set != self.ablation.get('expert_set', 'all'):
-            raise ValueError('Expert set differs from the ablation configuration')
-
-        ## Auxiliary Tokens
-        self.aux = nn.Parameter(torch.randn(1, num_aux_tokens, embed_dim))
-
-        ## Interaction Map and LLM Projection Heads
-        self.interaction_adapter = InteractionAdapter(embed_dim, patch_size)
-
+        ## Compressed Interaction Prefix and Two Soft Evidence Tokens
+        self.interaction_adapter = SVDInteractionAdapter(embed_dim, patch_size, svd_rank)
+        self.evidence_selector = CorrespondenceSelector(embed_dim, evidence_dim, position_dim)
         llm_width = self.llm.model.get_input_embeddings().embedding_dim
-        self.image_head = nn.Linear(embed_dim, llm_width)
         self.interaction_head = nn.Linear(embed_dim, llm_width)
-        self.expert_head = nn.Linear(embed_dim, llm_width)
+        self.evidence_head = nn.Linear(evidence_dim, llm_width)
 
-        # Unused modules get no gradients; DDP would otherwise fail on unused parameters.
-        if self.ablation.get('prefix', 'full') == 'image':
-            for module in (self.text_encoder, self.interaction, self.interaction_adapter, self.moe, self.interaction_head, self.expert_head):
-                module.requires_grad_(False)
-            self.aux.requires_grad_(False)
+        ## Both Selectors See the Complete Text and Image Features
+        self.text_selector = TokenSelector(embed_dim, selector_keep_ratio, selector_dim, selector_temperature)
+        self.image_selector = TokenSelector(embed_dim, image_keep_ratio, selector_dim, selector_temperature)
 
-        if self.ablation.get('expert_set', 'all') == 'self':
-            self.aux.requires_grad_(False)
-
-    def encode_prefix(self, text_inputs, image_inputs, map_image_inputs = None):
-        """map_image_inputs, if given, builds the interaction map from another image while the image tokens keep the true one."""
+    def encode_prefix(self, text_inputs, image_inputs):
         image_features = self.vision_encoder(**image_inputs)
         image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
-
-        # The image-only baseline has no router, so it returns zero-width weights.
-        if self.ablation.get('prefix', 'full') == 'image':
-            return self.image_head(image_features), image_mask, image_features.new_empty((image_features.size(0), 0))
-
-        # Process the question.
         text_features, text_mask = self.text_encoder(**text_inputs)
 
-        # Interaction between text and vision features.
-        map_features = image_features if map_image_inputs is None else self.vision_encoder(**map_image_inputs)
-        similarity = self.interaction(text_features, map_features)
-        similarity = select_interaction_map(similarity, self.ablation.get('shared_map', 'full'))
-        interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
+        selected_text, selected_text_mask, text_indices = self.text_selector(text_features, text_mask, image_features, image_mask)
+        selected_image, selected_image_mask, image_indices = self.image_selector(image_features, image_mask, text_features, text_mask)
 
-        # Select the expert and router inputs from the shared map independently.
-        expert_map = select_interaction_map(interaction_map, self.ablation['expert_map'])
-        router_map = select_interaction_map(interaction_map, self.ablation['router_map'])
-        expert_outputs, expert_mask, weights = self.moe(expert_map, self.aux, map_mask, router_x = router_map)
+        # Select both subsets before constructing their text-by-image map.
+        similarity = self.interaction(selected_text, selected_image)
+        interaction_tokens, _, _, token_mask = self.interaction_adapter(similarity, selected_text_mask, selected_image_mask,
+                                                                       row_indices = text_indices, column_indices = image_indices)
 
-        # Pass image, interaction, and each weighted expert output to the LLM.
-        prefix = torch.cat([self.image_head(image_features), self.interaction_head(interaction_tokens), self.expert_head(expert_outputs)], dim = 1)
-        prefix_mask = torch.cat([image_mask, token_mask, expert_mask], dim = 1)
+        vision = self.vision_encoder.clip.config.vision_config
+        grid_size = int(vision.image_size) // int(vision.patch_size)
+        evidence, _ = self.evidence_selector(similarity, selected_text, selected_text_mask, selected_image_mask,
+                                             text_indices, image_indices, text_features, text_mask,
+                                             interaction_tokens, token_mask, grid_size)
+
+        # The original question is tokenized separately by the LLM, unchanged.
+        prefix = torch.cat((self.interaction_head(interaction_tokens), self.evidence_head(evidence)), dim = 1)
+        prefix_mask = torch.cat((token_mask, torch.ones(evidence.shape[:2], dtype = torch.bool, device = token_mask.device)), dim = 1)
+        prefix = prefix.masked_fill(~prefix_mask[:, :, None], 0)
+        weights = image_features.new_empty((image_features.size(0), 0))
 
         return prefix, prefix_mask, weights
 
@@ -99,7 +78,6 @@ class IPMoE(nn.Module):
         if cfg.bos_token_id is None or cfg.eos_token_id is None:
             raise ValueError('CLIP text configuration must define BOS and EOS token IDs')
         
-        num_experts = 3 if self.ablation.get('expert_set', 'all') == 'all' else 1
         lengths = []
         for ids, mask in zip(text_inputs['input_ids'], text_inputs['attention_mask']):
             content = ids[mask.bool()]
@@ -110,11 +88,11 @@ class IPMoE(nn.Module):
                 content = content[:-1]
         
             text_tokens = max(content.numel(), 1)  # Empty chunk retains its EOS.
-            interaction_tokens = ((text_tokens + p - 1) // p) * ((image_tokens + p - 1) // p)
-            if self.ablation.get('prefix', 'full') == 'image':
-                interaction_tokens = 0
-
-            lengths.append(image_tokens + (1 + num_experts) * interaction_tokens)
+            selected_text = self.text_selector.selected_count(text_tokens)
+            selected_image = self.image_selector.selected_count(image_tokens)
+            rank = min(self.interaction_adapter.svd_rank, selected_text, selected_image)
+            interaction_tokens = ((rank + p - 1) // p) * ((selected_image + p - 1) // p)
+            lengths.append(interaction_tokens + self.evidence_selector.num_tokens)
         
         return lengths
 
@@ -132,7 +110,7 @@ class IPMoE(nn.Module):
 
             # Empty DDP ranks must still participate in every gradient reduction.
             loss = sum(parameter.reshape(-1)[0].float() * 0 for parameter in self.parameters() if parameter.requires_grad)
-            weights = self.aux.new_empty((0, 3))
+            weights = self.interaction_head.weight.new_empty((0, 0))
             return (loss, weights, 0) if return_stats else (loss, weights)
 
         # The tokenizer raises NoValidTargetsError before encoding an empty selection.
@@ -153,12 +131,11 @@ class IPMoE(nn.Module):
         return loss, weights
 
     @torch.no_grad()
-    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True,
-                 map_image_inputs = None):
+    def generate(self, questions, text_inputs, image_inputs, context_limit, max_new_tokens = 32, enforce_mcq_format = True):
         if self.training:
             raise RuntimeError('Call model.eval() before generation')
         
-        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs, map_image_inputs)
+        prefix, prefix_mask, weights = self.encode_prefix(text_inputs, image_inputs)
         text_budget = [context_limit - length - max_new_tokens for length in prefix_mask.sum(dim = 1).tolist()]
 
         token_rows, positions = self.llm.tokenize_generation_chats(questions, max_prompt_tokens = text_budget, enforce_mcq_format = enforce_mcq_format)

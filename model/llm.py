@@ -20,7 +20,7 @@ QWEN_MODEL_NAMES = {
     7: 'Qwen/Qwen2.5-VL-7B-Instruct',
 }
 
-# Placeholder token that marks where the image features go.
+# Placeholder token that marks where the interaction prefix goes.
 MM_MARKER = '<|ipmoe_mm|>'
 
 # Fixed date so the chat template always gives the same tokens.
@@ -65,7 +65,7 @@ def _format_question(question, enforce_mcq_format):
 class NoValidTargetsError(ValueError):
     pass
 
-class _ImagePrefixLLM(nn.Module):
+class _PrefixLLM(nn.Module):
     # Subclasses enable this when FlashAttention can read packed rows from their position IDs.
     pack_training_rows = False
 
@@ -250,14 +250,14 @@ class _ImagePrefixLLM(nn.Module):
 
             token_embeddings = embed(token_row)
             text_before = token_embeddings[:insert_position]
-            image_features = prefix[row_index]
+            prefix_features = prefix[row_index]
             if prefix_mask is not None:
-                image_features = image_features[prefix_mask[row_index].bool()]
+                prefix_features = prefix_features[prefix_mask[row_index].bool()]
 
-            image_features = image_features.to(token_embeddings.dtype)
+            prefix_features = prefix_features.to(token_embeddings.dtype)
             text_after = token_embeddings[insert_position:]
 
-            input_row = torch.cat([text_before, image_features, text_after], dim = 0)
+            input_row = torch.cat([text_before, prefix_features, text_after], dim = 0)
             input_rows.append(input_row)
 
             if label_rows is not None:
@@ -265,9 +265,9 @@ class _ImagePrefixLLM(nn.Module):
                 labels_before = text_labels[:insert_position]
                 labels_after = text_labels[insert_position:]
 
-                # Image features are inputs, so they have no target token labels.
-                image_labels = torch.full((image_features.size(0),), -100, dtype = text_labels.dtype, device = text_labels.device)
-                label_row = torch.cat([labels_before, image_labels, labels_after], dim = 0)
+                # Interaction features are inputs, so they have no target token labels.
+                prefix_labels = torch.full((prefix_features.size(0),), -100, dtype = text_labels.dtype, device = text_labels.device)
+                label_row = torch.cat([labels_before, prefix_labels, labels_after], dim = 0)
                 merged_label_rows.append(label_row)
 
         return input_rows, merged_label_rows
@@ -395,8 +395,8 @@ class _ImagePrefixLLM(nn.Module):
 
         return [prediction.strip() for prediction in decoded]
 
-class LlamaLLM(_ImagePrefixLLM):
-    def __init__(self, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+class LlamaLLM(_PrefixLLM):
+    def __init__(self, llm_size = 1, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
         if llm_size not in MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(MODEL_NAMES)}')
 
@@ -408,8 +408,8 @@ class LlamaLLM(_ImagePrefixLLM):
         # SDPA and eager would need a full block-diagonal mask over the packed sequence.
         self.pack_training_rows = attn_implementation == 'flash_attention_2'
 
-class Qwen25VLLLM(_ImagePrefixLLM):
-    def __init__(self, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+class Qwen25VLLLM(_PrefixLLM):
+    def __init__(self, llm_size = 3, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
         if llm_size not in QWEN_MODEL_NAMES:
             raise ValueError(f'Invalid llm_size={llm_size}. Expected one of {sorted(QWEN_MODEL_NAMES)}')
 
@@ -421,12 +421,12 @@ class Qwen25VLLLM(_ImagePrefixLLM):
         mlp_layers = r'mlp\.(gate_proj|up_proj|down_proj)'
         target_modules = decoder_layers + '(' + attention_layers + '|' + mlp_layers + ')'
 
-        # Our image features use sequence positions on all three Qwen MRoPE axes.
+        # Interaction-prefix features use sequence positions on all three Qwen MRoPE axes.
         super().__init__(model_name, Qwen2_5_VLForConditionalGeneration, lora_rank, attn_implementation,
                          gradient_checkpointing, target_modules, torch_dtype)
 
-def llamaAPI(device, llm_size = 1, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+def llamaAPI(device, llm_size = 1, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
     return LlamaLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype).to(device)
 
-def qwenAPI(device, llm_size = 3, lora_rank = 64, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
+def qwenAPI(device, llm_size = 3, lora_rank = 16, attn_implementation = 'sdpa', gradient_checkpointing = True, torch_dtype = torch.float32):
     return Qwen25VLLLM(llm_size, lora_rank, attn_implementation, gradient_checkpointing, torch_dtype).to(device)
