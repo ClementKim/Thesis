@@ -46,7 +46,7 @@ class IPMoEVLMEval(BaseModel):
         super().__init__()
 
         if os.environ.get('IPMOE_INTERVENTION'):
-            raise ValueError('IPMOE_INTERVENTION is no longer supported; evaluation uses the single svd_evidence_prefix architecture')
+            raise ValueError('IPMOE_INTERVENTION is no longer supported; evaluation uses the ablation and selection seed stored in the checkpoint')
 
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError('max_new_tokens must be a positive integer')

@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import get_cosine_schedule_with_warmup
 
-from configuration import MODEL_DEFAULTS, configure_model
+from configuration import ABLATIONS, MODEL_DEFAULTS, configure_model
 
 # Dataset
 from preprocessing import train_dataset, make_collate_fn, PREPROCESSING_PROTOCOL, SOURCES
@@ -182,6 +182,9 @@ def run_training(args, device, rank, world_size):
     model_options = {field: value for field, value in config.items() if field not in ('architecture', 'interaction_type', 'drop')}
     ipmoe = IPMoE(text_encoder, vision_encoder, llm, **model_options).to(device)
     model = DDP(ipmoe, device_ids = [device.index] if device.type == 'cuda' else None, broadcast_buffers = False) if distributed else ipmoe
+    trainable_parameters = sum(parameter.numel() for parameter in ipmoe.parameters() if parameter.requires_grad)
+    if rank == 0:
+        print(f'Ablation: {args.ablation}, trainable parameters: {trainable_parameters}')
     
     # Start from identical weights, then use independent dropout streams per rank.
     torch.manual_seed(seed + rank)
@@ -246,6 +249,7 @@ def run_training(args, device, rank, world_size):
                 'args': vars(args), 'epoch': epoch + 1, 'step': step,
                 'protocol': PREPROCESSING_PROTOCOL, 'source': SOURCES,
                 'world_size': world_size, 'global_batch_size': args.batch_size * world_size,
+                'trainable_parameters': trainable_parameters,
                 'optimizer_steps_this_epoch': epoch_steps,
                 'data_counts': {
                     'train_split': len(train_set), 'val_split': len(val_set),
@@ -278,6 +282,9 @@ def parse_args():
     parser.add_argument('--seed', type = int, default = 42)
     parser.add_argument('--data-seed', type = int, default = 42)
 
+    parser.add_argument('--ablation', choices = ABLATIONS, default = MODEL_DEFAULTS['ablation'])
+    parser.add_argument('--selection-seed', type = int, default = MODEL_DEFAULTS['selection_seed'],
+                        help = 'Seed in [0, 2**63 - 1) for deterministic random subsets during evaluation; training uses the global PyTorch RNG seeded by --seed')
     parser.add_argument('--interaction-type', choices = ['bilinear'], default = 'bilinear')
     parser.add_argument('--patch-size', type = int, default = 16)
     parser.add_argument('--embed-dim', type = int, default = MODEL_DEFAULTS['embed_dim'])
@@ -307,7 +314,10 @@ def parse_args():
     args = parser.parse_args()
 
     if args.output_dir is None:
-        args.output_dir = os.path.join('checkpoint', MODEL_DEFAULTS['architecture'], f'seed_{args.seed}')
+        directory = os.path.join('checkpoint', MODEL_DEFAULTS['architecture'])
+        if args.ablation != 'full':
+            directory = os.path.join(directory, args.ablation)
+        args.output_dir = os.path.join(directory, f'seed_{args.seed}')
 
     configure_model(args)
 

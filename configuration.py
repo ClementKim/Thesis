@@ -1,9 +1,14 @@
 import math
 
 
+ABLATIONS = ('full', 'spectral_only', 'evidence_only', 'random_selection', 'direct_image')
+
+
 MODEL_DEFAULTS = {
     'architecture': 'svd_evidence_prefix',
     'interaction_type': 'bilinear',
+    'ablation': 'full',
+    'selection_seed': 42,
     'embed_dim': 256,
     'patch_size': 16,
     'svd_rank': 8,
@@ -18,23 +23,31 @@ MODEL_DEFAULTS = {
 
 
 def configure_model(args, checkpoint = False):
-    """Validate the single supported architecture before constructing its modules."""
+    """Validate the architecture and its saved ablation before constructing modules."""
     if checkpoint:
         if getattr(args, 'architecture', None) != MODEL_DEFAULTS['architecture']:
             raise ValueError('Checkpoint is not a svd_evidence_prefix checkpoint; interaction-ViT and earlier architectures are incompatible')
-        missing = [field for field in MODEL_DEFAULTS if not hasattr(args, field)]
+        variant_fields = ('ablation', 'selection_seed')
+        missing = [field for field in MODEL_DEFAULTS if field not in variant_fields and not hasattr(args, field)]
+        # Checkpoints predating ablations used the full architecture and default seed.
+        if any(hasattr(args, field) for field in variant_fields):
+            missing.extend(field for field in variant_fields if not hasattr(args, field))
         if missing:
             raise ValueError(f'Checkpoint has incomplete model configuration: {missing}')
 
-    removed = ('ablation', 'ablation_version', 'ablation_config', 'text_selector', 'image_selector',
+    removed = ('ablation_version', 'ablation_config', 'text_selector', 'image_selector',
                'selector_num_heads', 'direct_interaction_prefix', 'num_aux_tokens',
                'interaction_depth', 'num_heads', 'mlp_ratio', 'attn_drop')
     if any(hasattr(args, field) for field in removed):
-        raise ValueError('Ablations, optional selector switches, expert settings, and interaction-ViT options are no longer supported')
+        raise ValueError('Legacy ablation configuration, optional selector switches, expert settings, and interaction-ViT options are no longer supported')
 
     config = {field: getattr(args, field, default) for field, default in MODEL_DEFAULTS.items()}
     if config['architecture'] != MODEL_DEFAULTS['architecture'] or config['interaction_type'] != 'bilinear':
         raise ValueError('Only the bilinear svd_evidence_prefix architecture is supported')
+    if not isinstance(config['ablation'], str) or config['ablation'] not in ABLATIONS:
+        raise ValueError(f'ablation must be one of {ABLATIONS}')
+    if type(config['selection_seed']) is not int or not 0 <= config['selection_seed'] < 2 ** 63 - 1:
+        raise ValueError('selection_seed must be an integer in [0, 2**63 - 1)')
 
     for field in ('embed_dim', 'patch_size', 'svd_rank', 'evidence_dim', 'position_dim', 'selector_dim'):
         if type(config[field]) is not int or config[field] <= 0:

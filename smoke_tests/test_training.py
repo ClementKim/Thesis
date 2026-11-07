@@ -1,17 +1,22 @@
 """CPU training smoke tests with synthetic inputs and no pretrained downloads."""
 
+import io
 import math
+import os
+import sys
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stderr
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from configuration import MODEL_DEFAULTS, configure_model
-from main import batch_loss, evaluate, train_step
+from configuration import ABLATIONS, MODEL_DEFAULTS, configure_model
+from main import batch_loss, evaluate, parse_args, train_step
 from model.ipmoe import IPMoE
 from model.llm import NoValidTargetsError
 
@@ -219,6 +224,35 @@ class ConfigurationSmokeTests(unittest.TestCase):
         restored = Namespace(**vars(args))
         self.assertEqual(configure_model(restored, checkpoint = True), config)
 
+    def test_saved_checkpoint_round_trip_preserves_each_ablation_and_seed(self):
+        for ablation in ABLATIONS:
+            with self.subTest(ablation = ablation):
+                args = Namespace(ablation = ablation, selection_seed = 17)
+                expected = configure_model(args)
+                checkpoint = io.BytesIO()
+                torch.save({'args': vars(args)}, checkpoint)
+                checkpoint.seek(0)
+                saved = torch.load(checkpoint, map_location = 'cpu', weights_only = True)
+                restored = Namespace(**saved['args'])
+                self.assertEqual(configure_model(restored, checkpoint = True), expected)
+                self.assertEqual((restored.ablation, restored.selection_seed), (ablation, 17))
+
+    def test_legacy_checkpoint_defaults_only_when_both_variant_fields_are_absent(self):
+        legacy = {field: value for field, value in MODEL_DEFAULTS.items() if field not in ('ablation', 'selection_seed')}
+        restored = Namespace(**legacy)
+        self.assertEqual(configure_model(restored, checkpoint = True), MODEL_DEFAULTS)
+        self.assertEqual((restored.ablation, restored.selection_seed), ('full', 42))
+        for field in legacy:
+            with self.subTest(missing = field):
+                values = dict(legacy)
+                del values[field]
+                with self.assertRaises(ValueError):
+                    configure_model(Namespace(**values), checkpoint = True)
+        for field, value in (('ablation', 'full'), ('selection_seed', 42)):
+            with self.subTest(partial_variant = field):
+                with self.assertRaisesRegex(ValueError, 'incomplete model configuration'):
+                    configure_model(Namespace(**dict(legacy, **{field: value})), checkpoint = True)
+
     def test_checkpoint_requires_architecture_and_every_model_field(self):
         for field in MODEL_DEFAULTS:
             with self.subTest(missing = field):
@@ -226,11 +260,24 @@ class ConfigurationSmokeTests(unittest.TestCase):
                 del values[field]
                 with self.assertRaises(ValueError):
                     configure_model(Namespace(**values), checkpoint = True)
-        for field, value in (('architecture', 'interaction_vit'), ('interaction_type', 'cosine'), ('ablation', None)):
+        for field, value in (('architecture', 'interaction_vit'), ('interaction_type', 'cosine'), ('ablation', None),
+                             ('ablation_version', 1), ('ablation_config', {})):
             with self.subTest(field = field, value = value):
                 values = dict(MODEL_DEFAULTS, **{field: value})
                 with self.assertRaises(ValueError):
                     configure_model(Namespace(**values), checkpoint = True)
+
+    def test_configuration_rejects_unsupported_ablation_and_invalid_selection_seeds(self):
+        invalid = [('ablation', 'unknown'), ('ablation', ''), ('ablation', ['full']),
+                   ('selection_seed', -1), ('selection_seed', True), ('selection_seed', 1.5), ('selection_seed', '42'),
+                   ('selection_seed', 2 ** 63 - 1), ('selection_seed', 2 ** 63)]
+        for field, value in invalid:
+            with self.subTest(field = field, value = value):
+                with self.assertRaises(ValueError):
+                    configure_model(Namespace(**{field: value}))
+        for seed in (0, 2 ** 63 - 2):
+            with self.subTest(valid_seed = seed):
+                self.assertEqual(configure_model(Namespace(selection_seed = seed))['selection_seed'], seed)
 
     def test_configuration_rejects_invalid_dimensions_and_nonfinite_controls(self):
         invalid = [('embed_dim', True), ('svd_rank', 0), ('patch_size', -1), ('position_dim', 1),
@@ -240,6 +287,40 @@ class ConfigurationSmokeTests(unittest.TestCase):
             with self.subTest(field = field, value = value):
                 with self.assertRaises((TypeError, ValueError)):
                     configure_model(Namespace(**{field: value}))
+
+
+class CommandLineSmokeTests(unittest.TestCase):
+    def test_default_path_preserves_full_and_separates_ablation_runs(self):
+        with patch.object(sys, 'argv', ['main.py']):
+            args = parse_args()
+        self.assertEqual((args.ablation, args.selection_seed), ('full', 42))
+        self.assertEqual(args.output_dir, os.path.join('checkpoint', 'svd_evidence_prefix', 'seed_42'))
+
+        for ablation in ABLATIONS:
+            with self.subTest(ablation = ablation):
+                with patch.object(sys, 'argv', ['main.py', '--ablation', ablation, '--seed', '7', '--selection-seed', '13']):
+                    args = parse_args()
+                directory = os.path.join('checkpoint', 'svd_evidence_prefix')
+                if ablation != 'full':
+                    directory = os.path.join(directory, ablation)
+                self.assertEqual(args.output_dir, os.path.join(directory, 'seed_7'))
+                self.assertEqual((args.ablation, args.selection_seed), (ablation, 13))
+
+    def test_explicit_output_path_is_preserved(self):
+        with patch.object(sys, 'argv', ['main.py', '--ablation', 'random_selection', '--output-dir', 'custom-checkpoint']):
+            args = parse_args()
+        self.assertEqual(args.output_dir, 'custom-checkpoint')
+
+    def test_cli_rejects_unknown_variant_and_out_of_range_selection_seed(self):
+        with patch.object(sys, 'argv', ['main.py', '--ablation', 'unknown']), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                parse_args()
+        self.assertEqual(raised.exception.code, 2)
+        for seed in (-1, 2 ** 63 - 1):
+            with self.subTest(seed = seed):
+                with patch.object(sys, 'argv', ['main.py', '--selection-seed', str(seed)]):
+                    with self.assertRaisesRegex(ValueError, 'selection_seed'):
+                        parse_args()
 
 
 if __name__ == '__main__':
