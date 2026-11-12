@@ -1,51 +1,33 @@
 #!/usr/bin/bash
-# Train every ablation arm in ablation.py for each seed, finishing all arms of one seed before the next.
-# Choose a subset with environment variables, e.g. SEEDS=42 ABLATIONS="full uniform" ./run.sh
+# Train the model for each seed. Choose a subset with environment variables, e.g. SEEDS=42 ./run.sh
 
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export FLASH_ATTENTION_DETERMINISTIC=1
 # DataLoader workers fork after the tokenizer is loaded; keep its threads in the main process only.
 export TOKENIZERS_PARALLELISM=false
 
-ALL_ABLATIONS=$(python -c 'from ablation import ABLATIONS; print(*ABLATIONS)') || exit 1
 SEEDS=${SEEDS:-"42 43 44"}
-ABLATIONS=${ABLATIONS:-$ALL_ABLATIONS}
 LLM_TYPE=${LLM_TYPE:-llama}
 # LLM_TYPE=${LLM_TYPE:-qwen}
 
-# Reject typos now rather than after days of other runs.
-for ABLATION in $ABLATIONS; do
-    if [[ " $ALL_ABLATIONS " != *" $ABLATION "* ]]; then
-        echo "Unknown ablation '$ABLATION'; choose from: $ALL_ABLATIONS" >&2
-        exit 1
-    fi
-done
-
 FAILED=()
 for SEED in $SEEDS; do
-    for ABLATION in $ABLATIONS; do
-        # eval.py loads checkpoint/seed_SEED by default; other arms need IPMOE_CHECKPOINT.
-        if [ "$ABLATION" = full ]; then
-            OUTPUT_DIR=checkpoint/seed_$SEED
-        else
-            OUTPUT_DIR=checkpoint/ablations/$ABLATION/seed_$SEED
-        fi
-        mkdir -p "$OUTPUT_DIR"
+    # eval.py loads checkpoint/seed_SEED by default; other locations need IPMOE_CHECKPOINT.
+    OUTPUT_DIR=checkpoint/seed_$SEED
+    mkdir -p "$OUTPUT_DIR"
 
-        echo "=== $(date '+%F %T') ablation=$ABLATION seed=$SEED output=$OUTPUT_DIR"
-        PYTHONHASHSEED="$SEED" torchrun --standalone --nproc-per-node=gpu main.py \
-            --seed $SEED \
-            --ablation $ABLATION \
-            --attn-implementation flash_attention_2 \
-            --llm-type "$LLM_TYPE" \
-            --output-dir $OUTPUT_DIR \
-            --batch-size 6 2>&1 | tee "$OUTPUT_DIR/train.log"
+    echo "=== $(date '+%F %T') seed=$SEED output=$OUTPUT_DIR"
+    PYTHONHASHSEED="$SEED" torchrun --standalone --nproc-per-node=gpu main.py \
+        --seed $SEED \
+        --attn-implementation flash_attention_2 \
+        --llm-type "$LLM_TYPE" \
+        --output-dir $OUTPUT_DIR \
+        --batch-size 6 2>&1 | tee "$OUTPUT_DIR/train.log"
 
-        # Keep going after a failed run; the log keeps its traceback.
-        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-            FAILED+=("$ABLATION/seed_$SEED")
-        fi
-    done
+    # Keep going after a failed run; the log keeps its traceback.
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        FAILED+=("seed_$SEED")
+    fi
 done
 
 if [ ${#FAILED[@]} -gt 0 ]; then

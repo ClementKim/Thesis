@@ -14,7 +14,6 @@ from vlmeval.dataset.image_yorn import ImageYORNDataset
 from vlmeval.smp import LMUDataRoot
 from vlmeval.vlm.base import BaseModel
 
-from ablation import configure_ablation
 from main import build_model
 from model.ipmoe import IPMoE
 
@@ -26,10 +25,10 @@ SHORT_ANSWER_INSTRUCTION = 'Answer the question using a single word or phrase.'
 MCQ_DATASETS = set(ImageMCQDataset.supported_datasets()) | set(CVBench.supported_datasets())
 YORN_DATASETS = set(ImageYORNDataset.supported_datasets())
 
-# Test-time interventions on a trained checkpoint, chosen with IPMOE_INTERVENTION (see rebuttal.sh):
+# Test-time interventions on a trained checkpoint, chosen with the IPMOE_INTERVENTION environment variable:
 # swap builds the interaction map from another image of the same benchmark while the image tokens keep the true one,
-# mean averages the shared map over patches as all_map_mean does, uniform replaces the learned weights with 1/3, and
-# zero_<expert> sets that expert's learned weight to 0 without renormalizing the other two.
+# mean averages the interaction map over patches before the prefix, experts and router, uniform replaces the learned
+# weights with 1/3, and zero_<expert> sets that expert's learned weight to 0 without renormalizing the other two.
 EXPERTS = ('self', 'cross', 'hybrid')
 INTERVENTIONS = ('swap', 'mean', 'uniform', *(f'zero_{expert}' for expert in EXPERTS))
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')
@@ -72,7 +71,9 @@ class IPMoEVLMEval(BaseModel):
         if not hasattr(args, 'num_aux_tokens'):
             raise ValueError('Checkpoint is missing num_aux_tokens')
 
-        configure_ablation(args, checkpoint = True)
+        # Checkpoints trained as ablation arms predate the removal of the ablation code and cannot be reconstructed.
+        if getattr(args, 'ablation', 'full') != 'full':
+            raise ValueError(f'Unsupported ablation checkpoint: {args.ablation!r}')
         args.gradient_checkpointing = False
 
         self.max_new_tokens = max_new_tokens
@@ -92,8 +93,7 @@ class IPMoEVLMEval(BaseModel):
                                                     self.context_limit, args.context_limit, model_context_limit, max_new_tokens)
         self.processor = processor
         self.model = IPMoE(processor, text_encoder, vision_encoder, interaction, moe, llm,
-                           args.embed_dim, args.patch_size, args.num_aux_tokens,
-                           ablation = args.ablation_config).to(self.device)
+                           args.embed_dim, args.patch_size, args.num_aux_tokens).to(self.device)
 
         ## Load Trained Parameters
         parameters = {name: parameter for name, parameter in self.model.named_parameters() if parameter.requires_grad}
@@ -132,22 +132,27 @@ class IPMoEVLMEval(BaseModel):
         if name not in INTERVENTIONS:
             raise ValueError(f'Unknown IPMOE_INTERVENTION {name!r}; choose from {INTERVENTIONS}')
 
-        ablation, moe = self.model.ablation, self.model.moe
-        if ablation.get('prefix', 'full') == 'image':
-            raise ValueError('The image_only arm has no interaction map to intervene on')
         if name == 'mean':
-            if ablation.get('shared_map', 'full') != 'full':
-                raise ValueError('This arm already averages its shared map')
-            # IPMoE.encode_prefix reads the configuration on every call.
-            ablation['shared_map'] = 'spatial_mean'
+            # Average the map over patches before the interaction prefix, the experts and the router.
+            interact = self.model.interaction.forward
+
+            def averaged(*args, **kwargs):
+                similarity = interact(*args, **kwargs)
+
+                return similarity.mean(dim = -1, keepdim = True).expand_as(similarity)
+
+            self.model.interaction.forward = averaged
         elif name != 'swap':
-            if moe.router_mode != 'learned' or moe.expert_set != 'all':
-                raise ValueError(f'{name} requires a learned router over all three experts')
+            route = self.model.moe.router.forward
             if name == 'uniform':
-                moe.router_mode = 'uniform'
+                def uniform(*args, **kwargs):
+                    weights = route(*args, **kwargs)
+
+                    return torch.full_like(weights, 1.0 / weights.size(-1))
+
+                self.model.moe.router.forward = uniform
             else:
                 column = EXPERTS.index(name[len('zero_'):])
-                route = moe.router.forward
 
                 def zeroed(*args, **kwargs):
                     weights = route(*args, **kwargs).clone()
@@ -155,7 +160,7 @@ class IPMoEVLMEval(BaseModel):
 
                     return weights
 
-                moe.router.forward = zeroed
+                self.model.moe.router.forward = zeroed
 
         logging.getLogger(f'vlmeval.{__name__}').warning('Test-time intervention: %s', name)
 

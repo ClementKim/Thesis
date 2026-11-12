@@ -1,13 +1,11 @@
 import torch
 import torch.nn as nn
 
-from ablation import ABLATIONS, select_interaction_map
-
 from .interaction import InteractionAdapter
 from .llm import NoValidTargetsError
 
 class IPMoE(nn.Module):
-    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size, num_aux_tokens, ablation = None):
+    def __init__(self, processor, text_encoder, vision_encoder, interaction, moe, llm, embed_dim, patch_size, num_aux_tokens):
         super().__init__()
 
         if num_aux_tokens < 2:
@@ -20,14 +18,6 @@ class IPMoE(nn.Module):
         self.moe = moe
         self.llm = llm
 
-        self.ablation = dict(ABLATIONS['full'] if ablation is None else ablation)
-        if self.ablation not in ABLATIONS.values():
-            raise ValueError('Unsupported ablation configuration')
-        if self.moe.router_mode != self.ablation['router_mode']:
-            raise ValueError('Router mode differs from the ablation configuration')
-        if self.moe.expert_set != self.ablation.get('expert_set', 'all'):
-            raise ValueError('Expert set differs from the ablation configuration')
-
         ## Auxiliary Tokens
         self.aux = nn.Parameter(torch.randn(1, num_aux_tokens, embed_dim))
 
@@ -39,23 +29,10 @@ class IPMoE(nn.Module):
         self.interaction_head = nn.Linear(embed_dim, llm_width)
         self.expert_head = nn.Linear(embed_dim, llm_width)
 
-        # Unused modules get no gradients; DDP would otherwise fail on unused parameters.
-        if self.ablation.get('prefix', 'full') == 'image':
-            for module in (self.text_encoder, self.interaction, self.interaction_adapter, self.moe, self.interaction_head, self.expert_head):
-                module.requires_grad_(False)
-            self.aux.requires_grad_(False)
-
-        if self.ablation.get('expert_set', 'all') == 'self':
-            self.aux.requires_grad_(False)
-
     def encode_prefix(self, text_inputs, image_inputs, map_image_inputs = None):
         """map_image_inputs, if given, builds the interaction map from another image while the image tokens keep the true one."""
         image_features = self.vision_encoder(**image_inputs)
         image_mask = torch.ones(image_features.shape[:2], dtype = torch.bool, device = image_features.device)
-
-        # The image-only baseline has no router, so it returns zero-width weights.
-        if self.ablation.get('prefix', 'full') == 'image':
-            return self.image_head(image_features), image_mask, image_features.new_empty((image_features.size(0), 0))
 
         # Process the question.
         text_features, text_mask = self.text_encoder(**text_inputs)
@@ -63,13 +40,9 @@ class IPMoE(nn.Module):
         # Interaction between text and vision features.
         map_features = image_features if map_image_inputs is None else self.vision_encoder(**map_image_inputs)
         similarity = self.interaction(text_features, map_features)
-        similarity = select_interaction_map(similarity, self.ablation.get('shared_map', 'full'))
         interaction_tokens, interaction_map, map_mask, token_mask = self.interaction_adapter(similarity, text_mask)
 
-        # Select the expert and router inputs from the shared map independently.
-        expert_map = select_interaction_map(interaction_map, self.ablation['expert_map'])
-        router_map = select_interaction_map(interaction_map, self.ablation['router_map'])
-        expert_outputs, expert_mask, weights = self.moe(expert_map, self.aux, map_mask, router_x = router_map)
+        expert_outputs, expert_mask, weights = self.moe(interaction_map, self.aux, map_mask)
 
         # Pass image, interaction, and each weighted expert output to the LLM.
         prefix = torch.cat([self.image_head(image_features), self.interaction_head(interaction_tokens), self.expert_head(expert_outputs)], dim = 1)
@@ -99,22 +72,20 @@ class IPMoE(nn.Module):
         if cfg.bos_token_id is None or cfg.eos_token_id is None:
             raise ValueError('CLIP text configuration must define BOS and EOS token IDs')
         
-        num_experts = 3 if self.ablation.get('expert_set', 'all') == 'all' else 1
         lengths = []
         for ids, mask in zip(text_inputs['input_ids'], text_inputs['attention_mask']):
             content = ids[mask.bool()]
             if content.numel() and content[0].item() == cfg.bos_token_id:
                 content = content[1:]
-        
+
             if content.numel() and content[-1].item() == cfg.eos_token_id:
                 content = content[:-1]
-        
+
             text_tokens = max(content.numel(), 1)  # Empty chunk retains its EOS.
             interaction_tokens = ((text_tokens + p - 1) // p) * ((image_tokens + p - 1) // p)
-            if self.ablation.get('prefix', 'full') == 'image':
-                interaction_tokens = 0
 
-            lengths.append(image_tokens + (1 + num_experts) * interaction_tokens)
+            # Image tokens, the interaction tokens, and each of the three experts' tokens.
+            lengths.append(image_tokens + 4 * interaction_tokens)
         
         return lengths
 

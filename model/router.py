@@ -65,66 +65,17 @@ class DynamicRouter(nn.Module):
 class MoE(nn.Module):
     """Keep each expert's output with its own weight for each input."""
 
-    def __init__(self, in_c, self_expert, cross_expert, hybrid_expert, router_mode = 'learned', expert_set = 'all'):
+    def __init__(self, in_c, self_expert, cross_expert, hybrid_expert):
         super().__init__()
 
-        if router_mode not in ('learned', 'uniform', 'static'):
-            raise ValueError(f'Unsupported router mode: {router_mode!r}')
-        if expert_set not in ('all', 'self', 'cross', 'hybrid'):
-            raise ValueError(f'Unsupported expert set: {expert_set!r}')
-        if expert_set != 'all' and router_mode != 'uniform':
-            raise ValueError('Single-expert configurations require uniform routing')
-
-        # Construct the original router in every arm to preserve subsequent initialization.
         self.router = DynamicRouter(in_c, num_experts = 3)
         self.self_expert = self_expert
         self.cross_expert = cross_expert
         self.hybrid_expert = hybrid_expert
-        self.router_mode = router_mode
-        self.expert_set = expert_set
 
-        if router_mode != 'learned':
-            self.router.requires_grad_(False)
-
-        if router_mode == 'static':
-            self.router_logits = nn.Parameter(torch.zeros(3))
-        else:
-            self.register_parameter('router_logits', None)
-
-        # Keep the original initialization order, but exclude inactive experts from training.
-        if expert_set != 'all':
-            for name, expert in (('self', self.self_expert), ('cross', self.cross_expert), ('hybrid', self.hybrid_expert)):
-                if name != expert_set:
-                    expert.requires_grad_(False)
-
-    def forward(self, x, auxiliary, mask = None, router_x = None):
-        """Return N or 3N tokens and masks, plus (B, 3) weights in self/cross/hybrid order."""
-        if self.expert_set != 'all':
-            if self.expert_set == 'self':
-                out, out_mask = self.self_expert(x, mask)
-                index = 0
-
-            elif self.expert_set == 'cross':
-                out, out_mask = self.cross_expert(x, auxiliary, mask)
-                index = 1
-
-            else:
-                out, out_mask = self.hybrid_expert(x, auxiliary, mask)
-                index = 2
-
-            weights = x.new_zeros((x.size(0), 3))
-            weights[:, index] = 1.0
-
-            return out, out_mask, weights
-
-        router_x = x if router_x is None else router_x
-
-        if self.router_mode == 'uniform':
-            weights = x.new_full((x.size(0), 3), 1.0 / 3.0)
-        elif self.router_mode == 'static':
-            weights = F.softmax(self.router_logits, dim = -1).unsqueeze(0).expand(x.size(0), -1)
-        else:
-            weights = self.router(router_x, mask)
+    def forward(self, x, auxiliary, mask = None):
+        """Return 3N tokens and masks, plus (B, 3) weights in self/cross/hybrid order."""
+        weights = self.router(x, mask)
 
         self_output, self_mask = self.self_expert(x, mask)
         cross_output, cross_mask = self.cross_expert(x, auxiliary, mask)

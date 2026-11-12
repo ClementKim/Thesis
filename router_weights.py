@@ -30,8 +30,6 @@ def main():
     args = parser.parse_args()
 
     model = IPMoEVLMEval(args.checkpoint)
-    if model.model.ablation['router_mode'] != 'learned' or model.model.ablation.get('expert_set', 'all') != 'all':
-        raise ValueError('Only arms with a learned router over all three experts have input-dependent weights')
 
     rows = []
     for name in args.data:
