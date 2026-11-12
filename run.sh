@@ -50,7 +50,7 @@ for SEED in $SEEDS; do
         --attn-implementation flash_attention_2 \
         --llm-type "$LLM_TYPE" \
         --output-dir "$OUTPUT_DIR" \
-        --batch-size 30 "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
+        --batch-size 70 "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
 
     STATUS=${PIPESTATUS[0]}
     if [ "$STATUS" -eq 130 ] || [ "$STATUS" -eq 143 ]; then
