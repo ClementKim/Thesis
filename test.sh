@@ -1,12 +1,12 @@
 #!/usr/bin/bash
-# Ablation: IP-MoE without the router and the expert pool (see test.py). The language model's prefix keeps the image
-# and interaction tokens; the experts, the router, their auxiliary tokens and expert_head are removed.
+# Run one of the nine IP-MoE classes in test.py, selected by ARM (default: no_moe).
+# Arms: full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid.
 # For each seed, train the arm as run.sh trains the full model and evaluate it as eval.sh does; then compare it with the
-# full model seed by seed. Choose with environment variables, e.g. SEEDS=42 STEPS="train eval" ./test.sh
-#   train    CKPT_DIR/seed_N (checkpoint/no_moe/llama/seed_N): checkpoint.pt and train.log. A finished run is kept;
+# full model seed by seed. For example: ARM=without_self LLM_TYPE=qwen SEEDS=42 STEPS="train eval" ./test.sh
+#   train    CKPT_DIR/seed_N (checkpoint/ARM/LLM_TYPE/seed_N): checkpoint.pt and train.log. A finished run is kept;
 #            RETRAIN=1 trains it again. Each attempt trains in seed_N/attempt-<time> (follow its train.log) and replaces
 #            the current run only once it has finished; the replaced run moves to seed_N/previous-<time>.
-#   eval     EVAL_DIR/seed_N (evaluation/no_moe/llama/seed_N) and its eval.log: one test.py eval per benchmark without a
+#   eval     EVAL_DIR/seed_N (evaluation/ARM/LLM_TYPE/seed_N) and its eval.log: one test.py eval per benchmark without a
 #            completed evaluation of the current checkpoint (REEVALUATE=1 evaluates them all again), with eval.sh's
 #            judges (NaturalBench by exact matching) and checks. A failed benchmark is evaluated again by the next run.
 #   compare  EVAL_DIR/comparison/seeds_<SEEDS>_<JUDGE>[_<DATASETS>]: scores, validation loss and training counters beside
@@ -15,6 +15,7 @@
 # FULL_CKPT_DIR and FULL_EVAL_DIR hold the full model's seeds (checkpoint/LLM_TYPE and evaluation/LLM_TYPE by default,
 # where they were moved after run.sh and eval.sh). With MATCH=1 (default) a seed is trained and evaluated only when its
 # full-model checkpoint exists and the arm's settings, GPU count and data equal that run's; MATCH=0 skips the check.
+# ARM=full keeps its new runs in checkpoint/full/LLM_TYPE and evaluation/full/LLM_TYPE, separate from the reference.
 # JUDGE as in eval.sh: gpt-6-luna reads OPENAI_API_KEY from VLMEvalKit/.env; JUDGE=exact_matching needs no LLM.
 # Extra arguments go to every evaluation, e.g. ./test.sh --judge-api-nproc 8
 #
@@ -44,13 +45,19 @@ JUDGE=${JUDGE:-gpt-6-luna}
 RETRAIN=${RETRAIN:-0}
 REEVALUATE=${REEVALUATE:-0}
 MATCH=${MATCH:-1}
-ARM=no_moe
+ARM=${ARM:-no_moe}
 CKPT_DIR=${CKPT_DIR:-checkpoint/$ARM/$LLM_TYPE}
 EVAL_DIR=${EVAL_DIR:-evaluation/$ARM/$LLM_TYPE}
 FULL_CKPT_DIR=${FULL_CKPT_DIR:-checkpoint/$LLM_TYPE}
 FULL_EVAL_DIR=${FULL_EVAL_DIR:-evaluation/$LLM_TYPE}
 
 # Reject mistakes now rather than after days of training.
+case "$ARM" in
+    full|image_only|no_moe|self_only|cross_only|hybrid_only|without_self|without_cross|without_hybrid) ;;
+    *)
+        echo "Unknown ARM '$ARM'; choose full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross or without_hybrid" >&2
+        exit 1 ;;
+esac
 if [ -n "${FORCE:-}" ] && [ "$FORCE" != 0 ]; then
     echo "FORCE is not used: RETRAIN=1 trains finished seeds again and REEVALUATE=1 evaluates them again" >&2
     exit 1
@@ -104,9 +111,9 @@ done
 # abbreviated options, so a prefix of a blocked option is blocked too.
 for ARG in "$@"; do
     NAME=${ARG%%=*}
-    for BLOCKED in --model --data --judge --work-dir --config --reuse --reuse-aux --mode; do
+    for BLOCKED in --arm --model --data --judge --work-dir --config --reuse --reuse-aux --mode; do
         if [[ $NAME == --?* && $BLOCKED == "$NAME"* ]]; then
-            echo "Extra arguments cannot set $BLOCKED (from $ARG); use DATASETS, JUDGE or EVAL_DIR, and see test.py eval" >&2
+            echo "Extra arguments cannot set $BLOCKED (from $ARG); use ARM, DATASETS, JUDGE or EVAL_DIR, and see test.py eval" >&2
             exit 1
         fi
     done
@@ -172,7 +179,7 @@ arm_state() {
     if [ "$MATCH" = 1 ]; then
         match=(--match "$FULL_CKPT_DIR/seed_$2/checkpoint.pt")
     fi
-    output=$(python test.py state "$1" --llm-type "$LLM_TYPE" --seed "$2" "${match[@]}") || return 1
+    output=$(python test.py state "$1" --arm "$ARM" --llm-type "$LLM_TYPE" --seed "$2" "${match[@]}") || return 1
     # Only the last line: libraries may print while they load.
     echo "${output##*$'\n'}"
 }
@@ -214,6 +221,7 @@ train() {
     fi
     echo "=== $(date '+%F %T') code=$CODE train seed=$seed llm=$LLM_TYPE output=$staged" | tee "$staged/train.log"
     PYTHONHASHSEED="$seed" torchrun --standalone --nproc-per-node=gpu test.py train \
+        --arm "$ARM" \
         "${match[@]}" \
         --seed "$seed" \
         --attn-implementation flash_attention_2 \
@@ -266,7 +274,7 @@ evaluate() {
     fi
 
     # The benchmarks without a completed evaluation of this checkpoint. It refuses a directory with other models' runs.
-    if ! output=$(python test.py pending "$checkpoint" "$work" --judge "$JUDGE" --data "${DATASET_LIST[@]}"); then
+    if ! output=$(python test.py pending "$checkpoint" "$work" --arm "$ARM" --judge "$JUDGE" --data "${DATASET_LIST[@]}"); then
         FAILED+=("eval seed_$seed (cannot evaluate into $work; see the error above)")
         return 1
     fi
@@ -289,6 +297,7 @@ evaluate() {
         fi
         echo "=== $(date '+%F %T') code=$CODE eval seed=$seed judge=$run_judge data=[$dataset] checkpoint=$checkpoint" | tee -a "$work/eval.log"
         PYTHONHASHSEED="$seed" IPMOE_CHECKPOINT="$checkpoint" torchrun --standalone --nproc-per-node=gpu test.py eval \
+            --arm "$ARM" \
             --model IPMoE \
             --data "$dataset" \
             --work-dir "$work" \
@@ -334,6 +343,7 @@ if want compare; then
     echo "=== $(date '+%F %T') code=$CODE compare seeds=[${SEED_LIST[*]}] judge=$JUDGE data=[${DATASET_LIST[*]}] full=$FULL_CKPT_DIR,$FULL_EVAL_DIR arm=$CKPT_DIR,$EVAL_DIR" \
         | tee "$STAGED/compare.log"
     python test.py compare \
+        --arm "$ARM" \
         --seeds "${SEED_LIST[@]}" \
         --data "${DATASET_LIST[@]}" \
         --judge "$JUDGE" \
