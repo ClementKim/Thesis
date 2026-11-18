@@ -4,8 +4,10 @@
 # JUDGE extracts answers that rule-based matching cannot parse; gpt-6-luna reads OPENAI_API_KEY from VLMEvalKit/.env.
 # JUDGE=exact_matching scores every benchmark without an LLM.
 # Extra arguments go to eval.py, e.g. ./eval.sh --judge-api-nproc 8
-# FULL_DIR holds the model seeds (checkpoint by default, where run.sh writes them; checkpoint/llama once moved)
-# and OUT the results, e.g. FULL_DIR=checkpoint/llama OUT=evaluation/llama ./eval.sh
+# FULL_DIR holds the model seeds and OUT the results: checkpoint/LLM_TYPE, where run.sh writes them, and
+# evaluation/LLM_TYPE by default, e.g. LLM_TYPE=qwen ./eval.sh. ARM=full ./test.sh evaluates into the same OUT; it
+# refuses a directory that holds eval.sh's runs, so evaluate each reference with one of the two.
+# Every eval.log entry begins with a line naming the configuration it ran with.
 # IPMOE_INTERVENTION applies a test-time intervention (see vlmeval_adapter.py); give it its own OUT.
 # Inference uses the decoder's context capacity, independent of the training cap.
 # Set IPMOE_CONTEXT_LIMIT=16384 to impose a smaller total token budget if needed.
@@ -24,8 +26,15 @@ trap 'exit 130' INT
 SEEDS=${SEEDS:-"42"}
 DATASETS=${DATASETS:-"NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"}
 JUDGE=${JUDGE:-gpt-6-luna}
-FULL_DIR=${FULL_DIR:-checkpoint}
-OUT=${OUT:-evaluation}
+LLM_TYPE=${LLM_TYPE:-llama}
+FULL_DIR=${FULL_DIR:-checkpoint/$LLM_TYPE}
+OUT=${OUT:-evaluation/$LLM_TYPE}
+
+# As in test.sh: untracked Python or shell files are code too.
+CODE=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ] || [ -n "$(git ls-files --others --exclude-standard -- '*.py' '*.sh' 2>/dev/null)" ]; then
+    CODE="$CODE+uncommitted"
+fi
 
 # Each scoring group below sets its own datasets and judge.
 for ARG in "$@"; do
@@ -79,8 +88,9 @@ for SEED in $SEEDS; do
 
     for PROTOCOL in "${PROTOCOLS[@]}"; do
         read -r RUN_JUDGE RUN_DATASETS <<< "$PROTOCOL"
-        echo "=== $(date '+%F %T') seed=$SEED judge=$RUN_JUDGE data=[$RUN_DATASETS] checkpoint=$CHECKPOINT intervention=${IPMOE_INTERVENTION:-none}" \
-            | tee -a "$WORK_DIR/eval.log"
+        echo "=== $(date '+%F %T') eval arm=full llm=$LLM_TYPE code=$CODE gpus=${CUDA_VISIBLE_DEVICES:-all} seed=$SEED" \
+             "judge=$RUN_JUDGE data=[$RUN_DATASETS] checkpoint=$CHECKPOINT intervention=${IPMOE_INTERVENTION:-none}" \
+             "context_limit=${IPMOE_CONTEXT_LIMIT:-decoder} extra=[$*]" | tee -a "$WORK_DIR/eval.log"
         PYTHONHASHSEED="$SEED" IPMOE_CHECKPOINT="$CHECKPOINT" torchrun --standalone --nproc-per-node=gpu eval.py \
             --model IPMoE \
             --data $RUN_DATASETS \

@@ -27,7 +27,8 @@ state    whether a checkpoint is a finished run of this arm, and with --match wh
          and completed training budget match Full.
 pending  the benchmarks an evaluation directory has no usable result of the arm's current checkpoint for.
 
-test.sh runs these for every seed; for example ARM=without_self LLM_TYPE=qwen ./test.sh.
+test.sh runs these for every seed; for example ARM=without_self LLM_TYPE=qwen ./test.sh. ARM=full trains and evaluates
+the reference itself into checkpoint/<llm>/seed_<seed> and evaluation/<llm>/seed_<seed>.
 Run from the repository root. Existing no_moe checkpoints and markers remain supported.
 Original main-branch non-full ablation checkpoints use a different format and are not loaded by this runner.
 """
@@ -558,7 +559,7 @@ def train(argv):
     args = main.parse_args()
     if args.output_dir == 'checkpoint':
         raise SystemExit('Pass --output-dir: main.py\'s default holds full-model checkpoints '
-                         '(test.sh uses checkpoint/<arm>/<llm>/seed_<seed>)')
+                         '(test.sh uses checkpoint/<llm>/seed_<seed> for full and checkpoint/<arm>/<llm>/seed_<seed> otherwise)')
 
     # run_training builds the model through the global name main.IPMoE, which is replaced below.
     if 'IPMoE' not in main.run_training.__code__.co_names:
@@ -720,7 +721,9 @@ def evaluate(argv):
               'intervention': intervention, 'context_limit': context_limit, 'provenance': provenance(), 'completed': False}
     if run.RANK == 0:
         record['sha256'] = file_sha256(checkpoint_path)
-        print(f'Arm {arm}: evaluating {checkpoint_path} (sha256 {record["sha256"]}); provenance {json.dumps(record["provenance"])}')
+        print(f'Arm {arm}: evaluating {checkpoint_path} (sha256 {record["sha256"]}) into {toolkit_args.work_dir}; '
+              f'provenance {json.dumps(record["provenance"])}')
+        print('Configuration: ' + json.dumps({key: record[key] for key in ('arm', 'judge', 'data', 'intervention', 'context_limit')}))
 
     runs = []
     upsert = run.upsert_run_status
@@ -947,6 +950,8 @@ def compare(argv):
     args.seeds, args.data = list(dict.fromkeys(args.seeds)), list(dict.fromkeys(args.data))
     arm_name = args.arm
     reference_name = 'full_reference' if arm_name == 'full' else 'full'
+    if os.path.realpath(args.arm_checkpoints) == os.path.realpath(args.full_checkpoints):
+        raise SystemExit(f'--arm-checkpoints and --full-checkpoints are both {args.full_checkpoints}; a run cannot be compared with itself')
 
     problems, rows, training, sources, checkpoints, verification = [], [], [], [], {}, []
     for model, checkpoint_root, result_root in ((reference_name, args.full_checkpoints, args.full_results),

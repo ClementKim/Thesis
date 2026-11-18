@@ -1,21 +1,27 @@
 #!/usr/bin/bash
 # Run one of the nine IP-MoE classes in test.py, selected by ARM (default: no_moe).
 # Arms: full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid.
+# ARM=all runs all nine in that order, the full model (the reference) first; an arm that fails does not stop the rest.
 # For each seed, train the arm as run.sh trains the full model and evaluate it as eval.sh does; then compare it with the
 # full model seed by seed. For example: ARM=without_self LLM_TYPE=qwen SEEDS=42 STEPS="train eval" ./test.sh
-#   train    CKPT_DIR/seed_N (checkpoint/ARM/LLM_TYPE/seed_N): checkpoint.pt and train.log. A finished run is kept;
+#   train    CKPT_DIR/seed_N (checkpoint/ARM/LLM_TYPE/seed_N; checkpoint/LLM_TYPE/seed_N for ARM=full): checkpoint.pt
+#            and train.log. A finished run is kept;
 #            RETRAIN=1 trains it again. Each attempt trains in seed_N/attempt-<time> (follow its train.log) and replaces
 #            the current run only once it has finished; the replaced run moves to seed_N/previous-<time>.
-#   eval     EVAL_DIR/seed_N (evaluation/ARM/LLM_TYPE/seed_N) and its eval.log: one test.py eval per benchmark without a
+#   eval     EVAL_DIR/seed_N (evaluation/ARM/LLM_TYPE/seed_N; evaluation/LLM_TYPE/seed_N for ARM=full) and its
+#            eval.log: one test.py eval per benchmark without a
 #            completed evaluation of the current checkpoint (REEVALUATE=1 evaluates them all again), with eval.sh's
 #            judges (NaturalBench by exact matching) and checks. A failed benchmark is evaluated again by the next run.
 #   compare  EVAL_DIR/comparison/seeds_<SEEDS>_<JUDGE>[_<DATASETS>]: scores, validation loss and training counters beside
 #            the full model's, with the run behind each score (sources.csv). It is replaced only by a comparison without
 #            problems; one with problems is kept as <that directory>.failed-<time>.
-# FULL_CKPT_DIR and FULL_EVAL_DIR hold the full model's seeds (checkpoint/LLM_TYPE and evaluation/LLM_TYPE by default,
-# where they were moved after run.sh and eval.sh). With MATCH=1 (default) a seed is trained and evaluated only when its
-# full-model checkpoint exists and the arm's settings, GPU count and data equal that run's; MATCH=0 skips the check.
-# ARM=full keeps its new runs in checkpoint/full/LLM_TYPE and evaluation/full/LLM_TYPE, separate from the reference.
+# FULL_CKPT_DIR and FULL_EVAL_DIR hold the full model's seeds (checkpoint/LLM_TYPE and evaluation/LLM_TYPE by default).
+# With MATCH=1 (default) a seed is trained and evaluated only when its full-model checkpoint exists and the arm's
+# settings, GPU count and data equal that run's; MATCH=0 skips the check.
+# ARM=full trains and evaluates that reference itself, in FULL_CKPT_DIR and FULL_EVAL_DIR. It has nothing to match or
+# compare with, so MATCH does not apply and STEPS defaults to "train eval". To retrain the full model as a check of the
+# reference instead, set CKPT_DIR and EVAL_DIR elsewhere, e.g. checkpoint/full/LLM_TYPE and evaluation/full/LLM_TYPE.
+# Every train.log, eval.log and compare.log entry begins with a line naming the configuration it ran with.
 # JUDGE as in eval.sh: gpt-6-luna reads OPENAI_API_KEY from VLMEvalKit/.env; JUDGE=exact_matching needs no LLM.
 # Extra arguments go to every evaluation, e.g. ./test.sh --judge-api-nproc 8
 #
@@ -36,26 +42,83 @@ unset IPMOE_INTERVENTION
 trap 'exit 130' INT
 
 ALL_STEPS="train eval compare"
-ALL_DATASETS="NaturalBenchDataset CV-Bench-2D CV-Bench-3D MMBench_DEV_EN_V11 MMStar POPE SEEDBench_IMG"
-STEPS=${STEPS:-$ALL_STEPS}
+ALL_DATASETS="CV-Bench-2D CV-Bench-3D POPE"
 SEEDS=${SEEDS:-"42 43 44"}
-LLM_TYPE=${LLM_TYPE:-llama}
+LLM_TYPE=${LLM_TYPE:-qwen}
 DATASETS=${DATASETS:-$ALL_DATASETS}
 JUDGE=${JUDGE:-gpt-6-luna}
 RETRAIN=${RETRAIN:-0}
 REEVALUATE=${REEVALUATE:-0}
 MATCH=${MATCH:-1}
 ARM=${ARM:-no_moe}
-CKPT_DIR=${CKPT_DIR:-checkpoint/$ARM/$LLM_TYPE}
-EVAL_DIR=${EVAL_DIR:-evaluation/$ARM/$LLM_TYPE}
+ALL_ARMS="full image_only no_moe self_only cross_only hybrid_only without_self without_cross without_hybrid"
+
+# ARM=all runs this script for every arm in turn, the full model first: it is the reference the others are checked
+# against while they train and compared with afterwards.
+if [ "$ARM" = all ]; then
+    if [ -n "${CKPT_DIR:-}" ] || [ -n "${EVAL_DIR:-}" ]; then
+        echo "ARM=all keeps every arm in its own default directories; unset CKPT_DIR and EVAL_DIR" >&2
+        exit 1
+    fi
+    FAILED_ARMS=()
+    for EACH in $ALL_ARMS; do
+        EACH_STEPS=${STEPS:-}
+        if [ "$EACH" = full ] && [ -n "$EACH_STEPS" ]; then
+            # The reference has nothing to be compared with.
+            read -ra PARTS <<< "$EACH_STEPS"
+            EACH_STEPS=
+            for PART in "${PARTS[@]}"; do
+                [ "$PART" != compare ] && EACH_STEPS+="$PART "
+            done
+            if [ -z "$EACH_STEPS" ]; then
+                continue
+            fi
+        fi
+        echo "=== $(date '+%F %T') ARM=all: running ARM=$EACH"
+        ARM=$EACH STEPS=$EACH_STEPS bash "${BASH_SOURCE[0]}" "$@"
+        STATUS=$?
+        if [ "$STATUS" -eq 130 ]; then
+            exit 130
+        fi
+        if [ "$STATUS" -ne 0 ]; then
+            FAILED_ARMS+=("$EACH")
+        fi
+    done
+    if [ ${#FAILED_ARMS[@]} -gt 0 ]; then
+        echo "ARM=all: these arms failed (see their Failed: lines above): ${FAILED_ARMS[*]}" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
 FULL_CKPT_DIR=${FULL_CKPT_DIR:-checkpoint/$LLM_TYPE}
 FULL_EVAL_DIR=${FULL_EVAL_DIR:-evaluation/$LLM_TYPE}
+# The full model's runs are the reference the other arms are compared with, so ARM=full writes them there.
+if [ "$ARM" = full ]; then
+    CKPT_DIR=${CKPT_DIR:-$FULL_CKPT_DIR}
+    EVAL_DIR=${EVAL_DIR:-$FULL_EVAL_DIR}
+else
+    CKPT_DIR=${CKPT_DIR:-checkpoint/$ARM/$LLM_TYPE}
+    EVAL_DIR=${EVAL_DIR:-evaluation/$ARM/$LLM_TYPE}
+fi
+# Per GPU, as run.sh.
+BATCH_SIZE=${BATCH_SIZE:-10}
+same_dir() {
+    [ "$(realpath -m "$1")" = "$(realpath -m "$2")" ]
+}
+# REFERENCE=1 when this run is the full model's reference itself, which has nothing to match or be compared with.
+REFERENCE=0
+if [ "$ARM" = full ] && same_dir "$CKPT_DIR" "$FULL_CKPT_DIR"; then
+    REFERENCE=1
+    STEPS=${STEPS:-train eval}
+fi
+STEPS=${STEPS:-$ALL_STEPS}
 
 # Reject mistakes now rather than after days of training.
 case "$ARM" in
     full|image_only|no_moe|self_only|cross_only|hybrid_only|without_self|without_cross|without_hybrid) ;;
     *)
-        echo "Unknown ARM '$ARM'; choose full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross or without_hybrid" >&2
+        echo "Unknown ARM '$ARM'; choose full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid or all" >&2
         exit 1 ;;
 esac
 if [ -n "${FORCE:-}" ] && [ "$FORCE" != 0 ]; then
@@ -96,11 +159,31 @@ fi
 for SWITCH in RETRAIN REEVALUATE MATCH; do
     case "${!SWITCH}" in 0|1) ;; *) echo "$SWITCH must be 0 or 1" >&2; exit 1 ;; esac
 done
+if [ "$REFERENCE" = 1 ]; then
+    MATCH=0
+    if [[ " ${STEP_LIST[*]} " == *" compare "* ]]; then
+        echo "ARM=full trains the reference itself in $CKPT_DIR, so there is nothing to compare it with; compare the other arms" \
+             "with it, or set CKPT_DIR and EVAL_DIR elsewhere to compare a retrained full model with the reference" >&2
+        exit 1
+    fi
+    if ! same_dir "$EVAL_DIR" "$FULL_EVAL_DIR"; then
+        echo "ARM=full trains the reference in FULL_CKPT_DIR ($FULL_CKPT_DIR), so it evaluates into FULL_EVAL_DIR" \
+             "($FULL_EVAL_DIR); set FULL_EVAL_DIR rather than EVAL_DIR" >&2
+        exit 1
+    fi
+fi
 
-# The arm's seed directories must never be the full model's, nor where run.sh and eval.sh write by default.
+# The arm's seed directories must not be where run.sh and eval.sh write by default, nor the full model's unless this run
+# is that reference.
 for ARM_DIR in "$CKPT_DIR" "$EVAL_DIR"; do
-    for OTHER in "$FULL_CKPT_DIR" "$FULL_EVAL_DIR" checkpoint evaluation; do
-        if [ "$(realpath -m "$ARM_DIR")" = "$(realpath -m "$OTHER")" ]; then
+    for OTHER in checkpoint evaluation; do
+        if same_dir "$ARM_DIR" "$OTHER"; then
+            echo "$ARM_DIR is where run.sh and eval.sh write by default; choose another CKPT_DIR, EVAL_DIR or FULL_*_DIR" >&2
+            exit 1
+        fi
+    done
+    for OTHER in "$FULL_CKPT_DIR" "$FULL_EVAL_DIR"; do
+        if [ "$REFERENCE" = 0 ] && same_dir "$ARM_DIR" "$OTHER"; then
             echo "$ARM_DIR is $OTHER; CKPT_DIR and EVAL_DIR must keep the arm's seeds apart from the full model's runs" >&2
             exit 1
         fi
@@ -132,6 +215,19 @@ check_python() {
         exit 1
     fi
 }
+# test.py eval refuses an evaluation directory holding runs it did not make for this arm (VLMEvalKit would relink their
+# results), e.g. eval.sh's runs of the full model. Find them now rather than after days of training.
+if want eval; then
+    for SEED in "${SEED_LIST[@]}"; do
+        for RUN in "$EVAL_DIR/seed_$SEED"/IPMoE/T*/; do
+            if [ -f "$RUN/status.json" ] && [ ! -f "$RUN/$ARM.json" ]; then
+                echo "$EVAL_DIR/seed_$SEED holds evaluations that test.py eval did not make for $ARM (${RUN%/});" \
+                     "move that directory aside, as checkpoint/previous, or choose another EVAL_DIR" >&2
+                exit 1
+            fi
+        done
+    done
+fi
 if want train || want eval; then
     for COMMAND in torchrun flock; do
         if ! command -v "$COMMAND" > /dev/null; then
@@ -160,6 +256,15 @@ if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ] || [ -n "
     CODE="$CODE+uncommitted"
     echo "=== code=$CODE: commit test.py and test.sh so that the results name the code that produced them" >&2
 fi
+
+# The configuration every log entry begins with; the arguments add the step's own settings as key=value.
+config() {
+    local role=ablation
+    if [ "$ARM" = full ]; then
+        role=$([ "$REFERENCE" = 1 ] && echo reference || echo retrained-reference)
+    fi
+    echo "arm=$ARM ($role) llm=$LLM_TYPE code=$CODE gpus=${CUDA_VISIBLE_DEVICES:-all} $*"
+}
 
 FAILED=()
 
@@ -219,7 +324,8 @@ train() {
         FAILED+=("train seed_$seed (cannot create an attempt directory in $dir)")
         return 1
     fi
-    echo "=== $(date '+%F %T') code=$CODE train seed=$seed llm=$LLM_TYPE output=$staged" | tee "$staged/train.log"
+    echo "=== $(date '+%F %T') train $(config "seed=$seed" "batch_size=$BATCH_SIZE/GPU" "match=${match[1]:-none}" "output=$staged")" \
+        | tee "$staged/train.log"
     PYTHONHASHSEED="$seed" torchrun --standalone --nproc-per-node=gpu test.py train \
         --arm "$ARM" \
         "${match[@]}" \
@@ -227,7 +333,7 @@ train() {
         --attn-implementation flash_attention_2 \
         --llm-type "$LLM_TYPE" \
         --output-dir "$staged" \
-        --batch-size 6 2>&1 | tee -a "$staged/train.log"
+        --batch-size "$BATCH_SIZE" 2>&1 | tee -a "$staged/train.log"
 
     # Keep going after a failed run; the attempt's log keeps its traceback.
     if [ "${PIPESTATUS[0]}" -ne 0 ]; then
@@ -295,7 +401,8 @@ evaluate() {
         if [ "$dataset" = NaturalBenchDataset ]; then
             run_judge=exact_matching
         fi
-        echo "=== $(date '+%F %T') code=$CODE eval seed=$seed judge=$run_judge data=[$dataset] checkpoint=$checkpoint" | tee -a "$work/eval.log"
+        echo "=== $(date '+%F %T') eval $(config "seed=$seed" "judge=$run_judge" "data=[$dataset]" "checkpoint=$checkpoint" \
+            "context_limit=${IPMOE_CONTEXT_LIMIT:-decoder}" "extra=[${EXTRA[*]}]")" | tee -a "$work/eval.log"
         PYTHONHASHSEED="$seed" IPMOE_CHECKPOINT="$checkpoint" torchrun --standalone --nproc-per-node=gpu test.py eval \
             --arm "$ARM" \
             --model IPMoE \
@@ -340,7 +447,8 @@ if want compare; then
     COMPARISON=$EVAL_DIR/comparison/$NAME
     mkdir -p "$EVAL_DIR/comparison"
     STAGED=$(mktemp -d "$COMPARISON.tmp-XXXX")
-    echo "=== $(date '+%F %T') code=$CODE compare seeds=[${SEED_LIST[*]}] judge=$JUDGE data=[${DATASET_LIST[*]}] full=$FULL_CKPT_DIR,$FULL_EVAL_DIR arm=$CKPT_DIR,$EVAL_DIR" \
+    echo "=== $(date '+%F %T') compare $(config "seeds=[${SEED_LIST[*]}]" "judge=$JUDGE" "data=[${DATASET_LIST[*]}]" \
+        "full=$FULL_CKPT_DIR,$FULL_EVAL_DIR" "runs=$CKPT_DIR,$EVAL_DIR")" \
         | tee "$STAGED/compare.log"
     python test.py compare \
         --arm "$ARM" \

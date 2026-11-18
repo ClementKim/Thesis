@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import random
 import argparse
@@ -189,6 +190,8 @@ def run_training(args, device, rank, world_size):
 
     distributed = world_size > 1
     if rank == 0:
+        # Every argument, defaults included, so that the log names the whole configuration it trained with.
+        print(f'Configuration: {json.dumps(vars(args), default = str)}')
         print(f'Using device: {device}, processes: {world_size}, global batch size: {args.batch_size * world_size}')
 
     ## Dataset and Dataloader
