@@ -13,10 +13,14 @@
 #   eval     EVAL_DIR/seed_N (evaluation/ARM/LLM_TYPE/seed_N; evaluation/LLM_TYPE/seed_N for ARM=full) and its
 #            eval.log: one test.py eval per benchmark without a
 #            completed evaluation of the current checkpoint (REEVALUATE=1 evaluates them all again), with eval.sh's
-#            judges (NaturalBench by exact matching) and checks. A failed benchmark is evaluated again by the next run.
+#            judge (EXACT_DATASETS below by exact matching) and checks. A failed benchmark is evaluated again by the
+#            next run.
 #   compare  EVAL_DIR/comparison/seeds_<SEEDS>_<JUDGE>[_<DATASETS>]: scores, validation loss and training counters beside
 #            the full model's, with the run behind each score (sources.csv). It is replaced only by a comparison without
 #            problems; one with problems is kept as <that directory>.failed-<time>.
+# DATASETS chooses the benchmarks to evaluate and compare (default: the fifteen of ALL_DATASETS below), e.g.
+# DATASETS="CV-Bench-2D CV-Bench-3D POPE" for the first three alone. The comparison needs every chosen benchmark of both
+# models, so evaluate the full model on them first (ARM=full STEPS=eval ./test.sh).
 # FULL_CKPT_DIR and FULL_EVAL_DIR hold the full model's seeds (checkpoint/LLM_TYPE and evaluation/LLM_TYPE by default).
 # With MATCH=1 (default) a seed is trained and evaluated only when its full-model checkpoint exists and the arm's
 # settings, GPU count and data equal that run's; MATCH=0 skips the check.
@@ -44,7 +48,12 @@ unset IPMOE_INTERVENTION
 trap 'exit 130' INT
 
 ALL_STEPS="train eval compare"
-ALL_DATASETS="CV-Bench-2D CV-Bench-3D POPE"
+# The three benchmarks of the first comparison, then the twelve further ones (test.py's EXTRA_DATASETS, in its order).
+ALL_DATASETS="CV-Bench-2D CV-Bench-3D POPE VSR-zeroshot EmbSpatialBench 3DSRBench TopViewRS OmniSpatialBench RealWorldQA MMVP AMBER MME GQA_TestDev_Balanced HallusionBench CountBenchQA"
+# Scored without a judge whatever JUDGE is (test.py's EXACT_DATASETS, which must name the same benchmarks). NaturalBench,
+# GQA and CountBench never use one; the two EASI benchmarks would have a judge grade every answer, so they use their
+# rule-based option matching instead.
+EXACT_DATASETS="NaturalBenchDataset EmbSpatialBench OmniSpatialBench GQA_TestDev_Balanced CountBenchQA"
 SEEDS=${SEEDS:-"42 43 44"}
 LLM_TYPE=${LLM_TYPE:-qwen}
 DATASETS=${DATASETS:-$ALL_DATASETS}
@@ -396,11 +405,11 @@ evaluate() {
     fi
 
     mkdir -p "$work"
-    # One run per benchmark, so that a failure sends only that benchmark back. As in eval.sh, NaturalBench scores with
-    # its own answer extraction and never uses a judge, so it runs as exact_matching.
+    # One run per benchmark, so that a failure sends only that benchmark back. As eval.sh does for NaturalBench, the
+    # benchmarks in EXACT_DATASETS run as exact_matching, so that their runs record how they were scored.
     for dataset in "${todo[@]}"; do
         run_judge=$JUDGE
-        if [ "$dataset" = NaturalBenchDataset ]; then
+        if [[ " $EXACT_DATASETS " == *" $dataset "* ]]; then
             run_judge=exact_matching
         fi
         echo "=== $(date '+%F %T') eval $(config "seed=$seed" "judge=$run_judge" "data=[$dataset]" "checkpoint=$checkpoint" \

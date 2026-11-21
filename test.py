@@ -64,8 +64,22 @@ from preprocessing import PREPROCESSING_PROTOCOL, SOURCES
 DEFAULT_ARM = 'no_moe'
 
 # The seven benchmarks of the thesis's Avg, in eval.sh's order, and the NaturalBench score it uses.
-DATASETS = ('NaturalBenchDataset', 'CV-Bench-2D', 'CV-Bench-3D', 'MMBench_DEV_EN_V11', 'MMStar', 'POPE', 'SEEDBench_IMG')
+AVG_DATASETS = ('NaturalBenchDataset', 'CV-Bench-2D', 'CV-Bench-3D', 'MMBench_DEV_EN_V11', 'MMStar', 'POPE', 'SEEDBench_IMG')
 NATURALBENCH_METRIC = 'Acc'
+# Twelve further benchmarks, in test.sh's order: six of spatial reasoning, MMVP's pairs that CLIP cannot tell apart,
+# AMBER's hallucination questions, MME's perception and cognition tasks, GQA's compositional questions,
+# HallusionBench's hallucination and illusion questions, and CountBench's counting questions.
+EXTRA_DATASETS = ('VSR-zeroshot', 'EmbSpatialBench', '3DSRBench', 'TopViewRS', 'OmniSpatialBench', 'RealWorldQA', 'MMVP',
+                  'AMBER', 'MME', 'GQA_TestDev_Balanced', 'HallusionBench', 'CountBenchQA')
+DATASETS = AVG_DATASETS + EXTRA_DATASETS
+# Scored without a judge whatever JUDGE is; test.sh's EXACT_DATASETS must name the same benchmarks. NaturalBench, GQA
+# and CountBench never use one, and the two EASI benchmarks would have a judge grade every answer instead of only the
+# answers that rules cannot parse, so they are scored by their rule-based option matching.
+EXACT_DATASETS = ('NaturalBenchDataset', 'EmbSpatialBench', 'OmniSpatialBench', 'GQA_TestDev_Balanced', 'CountBenchQA')
+# Yes/no benchmarks, scored into <benchmark>_auxmatch.xlsx with their summary in <benchmark>_score.csv.
+YES_NO_DATASETS = ('POPE', 'MME', 'AMBER', 'VSR-zeroshot', 'HallusionBench')
+# 3DSRBench's summary has one row per protocol; its paper reports accuracy under circular and flipped evaluation.
+THREEDSR_SETTING = 'flip_circ_eval'
 # Map interventions supported by every setup that uses the interaction path.
 INTERVENTIONS = ('swap', 'mean')
 # Two-sided 95% quantiles of Student's t by degrees of freedom, for intervals over a few seeds without scipy.
@@ -809,17 +823,29 @@ def evaluate(argv):
 def result_files(dataset, judge):
     """The scored file VLMEvalKit writes for one benchmark of IPMoE, and the summary beside it with the headline score."""
     base = f'IPMoE_{dataset}'
-    if dataset == 'NaturalBenchDataset':
+    # Neither writes a scored file of its own, so the predictions stand for it.
+    if dataset in ('NaturalBenchDataset', 'CountBenchQA'):
         return f'{base}.xlsx', f'{base}_acc.csv'
 
-    if dataset == 'POPE':
+    if dataset in YES_NO_DATASETS:
         return f'{base}_auxmatch.xlsx', f'{base}_score.csv'
+
+    # The EASI benchmarks name their files after the scoring mode; EXACT_DATASETS always run rule-based.
+    if dataset in ('EmbSpatialBench', 'OmniSpatialBench'):
+        return f'{base}_extract_matching.xlsx', f'{base}_extract_matching_acc.csv'
+
+    # Neither names its files after the judge.
+    if dataset == '3DSRBench':
+        return f'{base}_result.xlsx', f'{base}_results.tsv'
+
+    if dataset == 'GQA_TestDev_Balanced':
+        return f'{base}_results.xlsx', f'{base}_acc.csv'
 
     return f'{base}_{judge}_result.xlsx', f'{base}_acc.csv'
 
 def expected_judge(dataset, judge):
-    """eval.sh and test.sh score NaturalBench by exact matching, whatever the judge."""
-    return 'exact_matching' if dataset == 'NaturalBenchDataset' else judge
+    """test.sh scores EXACT_DATASETS by exact matching whatever the judge, as eval.sh scores NaturalBench."""
+    return 'exact_matching' if dataset in EXACT_DATASETS else judge
 
 def read_run_marker(directory):
     """Return (record, problem), recognizing every setup and the original no_moe.json format."""
@@ -879,17 +905,47 @@ def run_problem(directory, dataset, judge, digest, arm = DEFAULT_ARM, require_ma
     return None
 
 def headline(path, dataset):
-    """The headline score in percent of DATASET's summary file PATH."""
+    """The headline score of DATASET's summary file PATH: in percent, except MME's total out of 2800."""
     import pandas as pd
 
-    table = pd.read_csv(path)
+    # 3DSRBench's summary is a .tsv, and the EASI benchmarks write tab-separated values into their .csv.
+    tabbed = dataset in ('EmbSpatialBench', 'OmniSpatialBench', '3DSRBench')
+    table = pd.read_csv(path, sep = '\t' if tabbed else ',')
     if dataset == 'POPE':
         score = float(table.loc[table['split'] == 'Overall', 'Overall'].iloc[0])
 
     elif dataset == 'NaturalBenchDataset':
         score = 100 * float(table.set_index('Metric')['Score'][NATURALBENCH_METRIC])
 
+    elif dataset == 'VSR-zeroshot':
+        score = float(table['acc'].iloc[0])
+
+    elif dataset == 'AMBER':
+        # The mean of its existence, attribute and relation accuracies.
+        score = float(table['Avg ACC'].iloc[0])
+
+    elif dataset == 'MME':
+        # Its usual total: the perception score (out of 2000) plus the cognition score (out of 800).
+        score = float(table['perception'].iloc[0]) + float(table['reasoning'].iloc[0])
+
+    elif dataset in ('EmbSpatialBench', 'OmniSpatialBench'):
+        score = float(table['overall'].iloc[0])
+
+    elif dataset == '3DSRBench':
+        score = 100 * float(table.loc[table['setting'] == THREEDSR_SETTING, 'Overall'].iloc[0])
+
+    elif dataset == 'GQA_TestDev_Balanced':
+        score = float(table['Overall'].iloc[0])
+
+    elif dataset == 'HallusionBench':
+        # The mean of its answer, figure and question-pair accuracies over all questions.
+        score = float(table.loc[table['split'] == 'Overall', 'Avg'].iloc[0])
+
+    elif dataset == 'CountBenchQA':
+        score = float(table['accuracy'].iloc[0])
+
     else:
+        # A fraction: MMVP's is its paired accuracy, where both questions of a pair must be right.
         score = 100 * float(table['Overall'].iloc[0])
 
     if not math.isfinite(score):
@@ -949,7 +1005,7 @@ def pending(argv):
     parser.add_argument('checkpoint')
     parser.add_argument('work', help = 'the evaluation work directory of the checkpoint\'s seed')
     parser.add_argument('--judge', required = True)
-    parser.add_argument('--data', nargs = '+', choices = DATASETS, default = list(DATASETS))
+    parser.add_argument('--data', nargs = '+', choices = DATASETS, default = list(AVG_DATASETS))
     args = parser.parse_args(argv)
     arm = selected_checkpoint_arm(load_checkpoint(args.checkpoint), args.arm)
 
@@ -990,7 +1046,8 @@ def compare(argv):
     parser = argparse.ArgumentParser(prog = 'test.py compare', description = compare.__doc__)
     arm_argument(parser)
     parser.add_argument('--seeds', nargs = '+', type = int, required = True)
-    parser.add_argument('--data', nargs = '+', choices = DATASETS, default = list(DATASETS), help = 'benchmarks to compare; Avg needs all seven')
+    parser.add_argument('--data', nargs = '+', choices = DATASETS, default = list(AVG_DATASETS),
+                        help = 'benchmarks to compare (default: the thesis\'s seven); Avg is over those seven and needs them all')
     parser.add_argument('--judge', default = 'gpt-6-luna', help = 'the JUDGE both models were evaluated with')
     parser.add_argument('--full-checkpoints', required = True, help = 'directory of the full model\'s seed_N/checkpoint.pt')
     parser.add_argument('--full-results', required = True, help = 'directory of the full model\'s seed_N evaluation work directories')
@@ -1066,11 +1123,11 @@ def compare(argv):
                              'unverified_fields': unverified, 'completed_epochs': full['epoch'],
                              'optimizer_steps': full['step']})
 
-    metrics = [*args.data, *(['Avg'] if set(args.data) == set(DATASETS) else []), 'val_loss']
+    metrics = [*args.data, *(['Avg'] if set(AVG_DATASETS) <= set(args.data) else []), 'val_loss']
     table = pd.DataFrame(rows).set_index(['model', 'seed']).reindex(columns = metrics).astype(float)
     if 'Avg' in metrics:
-        # Average the seven within each seed first, as the thesis does.
-        table['Avg'] = table[list(DATASETS)].mean(axis = 1, skipna = False)
+        # Average the seven within each seed first, as the thesis does; further benchmarks do not enter it.
+        table['Avg'] = table[list(AVG_DATASETS)].mean(axis = 1, skipna = False)
 
     full, arm = table.xs(reference_name, level = 'model'), table.xs(arm_name, level = 'model')
     difference = arm - full
@@ -1101,7 +1158,8 @@ def compare(argv):
     sources.to_csv(os.path.join(args.output, 'sources.csv'), index = False)
 
     with pd.option_context('display.width', 250, 'display.max_columns', None, 'display.max_colwidth', 80):
-        print(f'Scores (percent) and validation loss by seed; difference = {arm_name} - {reference_name}; judge={args.judge}')
+        print(f'Scores (percent{"; MME is its total out of 2800" if "MME" in args.data else ""}) and validation loss by seed; '
+              f'difference = {arm_name} - {reference_name}; judge={args.judge}')
         print(by_seed.to_string(float_format = '{:.2f}'.format, formatters = {'val_loss': '{:.4f}'.format}))
         print('\nMean and sample SD over the seeds both models have, and a 95% paired t interval of the difference over those '
               'seeds; it reflects training randomness only, not the sampling of benchmark questions, and few seeds make it wide')
