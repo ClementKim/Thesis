@@ -1,9 +1,12 @@
-"""Nine IP-MoE setups, each represented by its own class in ARM_CLASSES.
+"""Eleven IP-MoE setups, each represented by its own class in ARM_CLASSES.
 
 Select --arm full, image_only, no_moe, self_only, cross_only, hybrid_only,
-without_self, without_cross, or without_hybrid. Training/state/compare default to no_moe;
-eval/pending infer the setup from the checkpoint and validate an explicit --arm if supplied.
+without_self, without_cross, without_hybrid, additive_map, or additive_map_no_moe. Training/state/compare default to
+no_moe; eval/pending infer the setup from the checkpoint and validate an explicit --arm if supplied.
 Each reduced setup is trained independently; without_* retains two experts with a two-way softmax.
+additive_map keeps every module of full but replaces the bilinear map t_i·v_j with a·t_i + b·v_j (learned a, b),
+which keeps the map's shape and prefix length and removes only the coupling between question tokens and patches.
+additive_map_no_moe makes the same replacement in no_moe.
 
 train    main.py's training loop and checkpoint format, with the selected class in place of IPMoE. Every module is
          built in the full model's order before unused branches are dropped, so kept modules start from its initialization
@@ -82,6 +85,26 @@ UNSET = '<unset>'
 
 _EXPERT_NAMES = ('self', 'cross', 'hybrid')
 
+# Initial standard deviation of a and b in the additive map. At initialization the bilinear map has an RMS of about 0.6
+# over valid cells, with |t_i| ≈ 3.5 and |v_j| ≈ 6.3 (48 training samples, seeds 42-44). With a, b ~ N(0, σ²I) the
+# additive map's expected RMS is σ·sqrt(|t|² + |v|²) ≈ 7.2σ, so σ = 0.09 starts both maps at the same scale.
+ADDITIVE_INIT_STD = 0.09
+
+
+class AdditiveInteraction(torch.nn.Module):
+    """S_ij = a·t_i + b·v_j: a learned score per question token plus one per image patch, with no token-patch coupling.
+
+    It has the bilinear map's (B, L, 576) shape, so the adapter, experts and router read it unchanged. Rows of padded
+    tokens hold b·v_j rather than 0, but the adapter, experts and router mask them exactly as before."""
+
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.text_weight = torch.nn.Parameter(torch.randn(embed_dim) * ADDITIVE_INIT_STD)
+        self.image_weight = torch.nn.Parameter(torch.randn(embed_dim) * ADDITIVE_INIT_STD)
+
+    def forward(self, text, vision):
+        return (text @ self.text_weight)[:, :, None] + (vision @ self.image_weight)[:, None, :]
+
 
 class _SelectedExperts(torch.nn.Module):
     """Run one or two retained experts, preserving their original parameter names."""
@@ -148,7 +171,9 @@ class _AblationIPMoE(IPMoE):
         # corresponding full-model initialization for the same seed.
         super().__init__(*args, **kwargs)
 
-        if self.active_experts:
+        if self.active_experts == _EXPERT_NAMES:
+            pass  # The full model's MoE, router and auxiliary tokens, unchanged.
+        elif self.active_experts:
             self.moe = _SelectedExperts(self.moe, self.active_experts)
             if self.active_experts == ('self',):
                 del self.aux
@@ -292,8 +317,34 @@ class WithoutHybrid(_AblationIPMoE):
     prefix_factor = 3
 
 
+class AdditiveMap(_AblationIPMoE):
+    """Full, with the bilinear map t_i·v_j replaced by the additive map a·t_i + b·v_j."""
+
+    arm_name = 'additive_map'
+    active_experts = _EXPERT_NAMES
+    prefix_factor = 4
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Drawn after every full-model module, so those keep the full model's initialization for the same seed.
+        self.interaction = AdditiveInteraction(self.aux.size(-1))
+
+
+class AdditiveMapNoMoE(NoMoE):
+    """No MoE, with the bilinear map t_i·v_j replaced by the additive map a·t_i + b·v_j."""
+
+    arm_name = 'additive_map_no_moe'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # NoMoE drops aux, so take the embedding width from the image head. Drawn after every full-model module, as in
+        # AdditiveMap, so kept modules match no_moe and a, b match additive_map for the same seed.
+        self.interaction = AdditiveInteraction(self.image_head.in_features)
+
+
 ARM_CLASSES = {setup.arm_name: setup for setup in
-               (Full, ImageOnly, NoMoE, SelfOnly, CrossOnly, HybridOnly, WithoutSelf, WithoutCross, WithoutHybrid)}
+               (Full, ImageOnly, NoMoE, SelfOnly, CrossOnly, HybridOnly, WithoutSelf, WithoutCross, WithoutHybrid,
+                AdditiveMap, AdditiveMapNoMoE)}
 
 
 def arm_argument(parser, default = DEFAULT_ARM):
@@ -543,7 +594,7 @@ def checkpoint_state(path, reference = None, arm = DEFAULT_ARM, **expected):
 def train(argv):
     """main.py's training with the selected setup; takes main.py's options, --arm, --match and --overwrite."""
     parser = argparse.ArgumentParser(prog = 'test.py train', add_help = False, allow_abbrev = False,
-                                     description = 'Train one of the nine IP-MoE setups. '
+                                     description = 'Train one of the eleven IP-MoE setups. '
                                                    'Every other option is main.py\'s, listed below.')
     arm_argument(parser)
     parser.add_argument('--match', metavar = 'FULL_CHECKPOINT',

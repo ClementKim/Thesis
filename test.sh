@@ -1,7 +1,9 @@
 #!/usr/bin/bash
-# Run one of the nine IP-MoE classes in test.py, selected by ARM (default: no_moe).
-# Arms: full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid.
-# ARM=all runs all nine in that order, the full model (the reference) first; an arm that fails does not stop the rest.
+# Run one of the eleven IP-MoE classes in test.py, selected by ARM (default: no_moe).
+# Arms: full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid,
+# additive_map (the full model with the bilinear map t_i·v_j replaced by a·t_i + b·v_j), additive_map_no_moe (no_moe
+# with the same replacement).
+# ARM=all runs all eleven in that order, the full model (the reference) first; an arm that fails does not stop the rest.
 # For each seed, train the arm as run.sh trains the full model and evaluate it as eval.sh does; then compare it with the
 # full model seed by seed. For example: ARM=without_self LLM_TYPE=qwen SEEDS=42 STEPS="train eval" ./test.sh
 #   train    CKPT_DIR/seed_N (checkpoint/ARM/LLM_TYPE/seed_N; checkpoint/LLM_TYPE/seed_N for ARM=full): checkpoint.pt
@@ -51,7 +53,7 @@ RETRAIN=${RETRAIN:-0}
 REEVALUATE=${REEVALUATE:-0}
 MATCH=${MATCH:-1}
 ARM=${ARM:-no_moe}
-ALL_ARMS="full image_only no_moe self_only cross_only hybrid_only without_self without_cross without_hybrid"
+ALL_ARMS="full image_only no_moe self_only cross_only hybrid_only without_self without_cross without_hybrid additive_map additive_map_no_moe"
 
 # ARM=all runs this script for every arm in turn, the full model first: it is the reference the others are checked
 # against while they train and compared with afterwards.
@@ -116,9 +118,9 @@ STEPS=${STEPS:-$ALL_STEPS}
 
 # Reject mistakes now rather than after days of training.
 case "$ARM" in
-    full|image_only|no_moe|self_only|cross_only|hybrid_only|without_self|without_cross|without_hybrid) ;;
+    full|image_only|no_moe|self_only|cross_only|hybrid_only|without_self|without_cross|without_hybrid|additive_map|additive_map_no_moe) ;;
     *)
-        echo "Unknown ARM '$ARM'; choose full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid or all" >&2
+        echo "Unknown ARM '$ARM'; choose full, image_only, no_moe, self_only, cross_only, hybrid_only, without_self, without_cross, without_hybrid, additive_map, additive_map_no_moe or all" >&2
         exit 1 ;;
 esac
 if [ -n "${FORCE:-}" ] && [ "$FORCE" != 0 ]; then
